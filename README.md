@@ -4,22 +4,26 @@
 
 一个基于 LSPosed 框架的 Xposed 模块，适用于 **ColorOS 16**（一加 / OPPO / realme），可将系统默认的小布助手替换为 Google Gemini 或 Google 一圈即搜。
 
----
+![Demo Video](assets/Record.mp4)
 
 ## ✨ 功能特性
 
 ### 🔘 电源键长按替换
+
 拦截 ColorOS 长按电源键唤醒小布助手的行为，支持替换为：
+
 - **Google Gemini** — 通过 VoiceInteractionManagerService 调用，体验与原生 Pixel 一致
 - **Google 一圈即搜** — 通过 ContextualSearchManager 直接调用
 - **不替换** — 保持原始小布助手行为
 
 ### 📱 手势指示条长按替换
+
 拦截长按导航手势指示条唤醒小布识屏的行为，替换为 Google 一圈即搜。
 
 > 需要在系统设置 > 系统导航方式中启用「长按手势指示条唤醒小布识屏」选项。
 
 ### 🔧 其他
+
 - 自动伪装设备型号为 Samsung S24 Ultra（仅对 Google 搜索应用生效），解锁圈搜功能的设备限制
 - 自动处理 ContextualSearch 服务注册与权限绕过
 - 阻止原始小布助手服务启动，避免冲突
@@ -102,6 +106,7 @@
 ## 🔨 构建
 
 ### 环境要求
+
 - Android Studio Ladybug (2024.2.1) 或更新版本
 - JDK 17
 - Android SDK 35
