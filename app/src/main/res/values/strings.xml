@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Oplus Assistant Hook</string>
+    <string name="xposed_desc">拦截ColorOS小布助手相关功能，替换为Google Gemini或一圈即搜</string>
+    <string-array name="xposed_scope">
+        <item>com.xdreamllc.oplus</item>
+        <item>android</item>
+        <item>com.android.systemui</item>
+        <item>com.google.android.googlequicksearchbox</item>
+    </string-array>
+</resources>
