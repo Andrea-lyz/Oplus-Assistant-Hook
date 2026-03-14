@@ -4,7 +4,7 @@
 
 一个基于 LSPosed 框架的 Xposed 模块，适用于 **ColorOS 16**（一加 / OPPO / realme），可将系统默认的小布助手替换为 Google Gemini 或 Google 一圈即搜。
 
-![Demo Video](assets/Record.mp4)
+![Demo GIF](assets/demo.gif)
 
 ## ✨ 功能特性
 
