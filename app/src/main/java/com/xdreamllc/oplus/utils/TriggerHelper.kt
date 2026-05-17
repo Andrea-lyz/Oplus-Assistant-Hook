@@ -1,7 +1,5 @@
 package com.xdreamllc.oplus.utils
 
-import android.content.ComponentName
-import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.os.Binder
@@ -9,8 +7,6 @@ import android.os.Bundle
 import android.os.IBinder
 import android.os.VibrationEffect
 import android.os.Vibrator
-import android.provider.Settings
-import android.service.voice.VoiceInteractionService
 import com.xdreamllc.oplus.Config
 
 /**
@@ -18,20 +14,27 @@ import com.xdreamllc.oplus.Config
  *
  * Design note for Gemini path:
  *
- * Older revisions tried to use VoiceInteractionManagerService.showSessionForActiveService to mimic
- * an assistant gesture and ride the SystemUI handoff. That path is racy on ColorOS: rewriting
- * Settings.Secure.assistant moments before showSession causes the active VoiceInteractionService
- * to rebind asynchronously, and showSession is dispatched before the new service is ready. The
- * result is the well-known "screen pulses but Gemini never appears" symptom that requires the user
- * to manually switch the default assistant to None and back to Google to recover.
+ * From `system_server` (uid 1000), `Intent.ACTION_VOICE_COMMAND` scoped to the Google app on
+ * recent ColorOS / Google App combinations resolves only to `HandsFreeActivity`, which inspects
+ * the caller and falls back to the Bluetooth SCO hands-free path when called by system uid,
+ * `finish()`-ing immediately and producing the well-known "screen pulses, nothing happens"
+ * symptom. Verified by inspecting `PackageManager.queryIntentActivities`: the result list contains
+ * no other matching component.
  *
- * The intent route below is what Google's own quick-settings tile uses to wake Gemini, doesn't
- * touch Settings.Secure on every press, and is observably reliable on the same hardware.
+ * Earlier versions of the module worked around the failure by rewriting `Settings.Secure.assistant`
+ * and calling `VoiceInteractionManagerService.showSessionForActiveService`, but the per-press
+ * Settings.Secure rewrite triggered an asynchronous VIS rebind that raced with the showSession
+ * dispatch, manifesting as the same symptom for unrelated reasons.
+ *
+ * The current strategy is:
+ *  1. Call VIMS.showSessionForActiveService directly without touching Settings.Secure. The user
+ *     is responsible for setting Google as the default assistant once (the settings UI offers a
+ *     dedicated button for this), so VIMS already has the correct active service bound.
+ *  2. If VIMS is unavailable, fall back to the intent route. This still fails on the
+ *     HandsFreeActivity-only ROMs but at least covers older devices where the resolver works.
+ *  3. Last resort: spawn `am start` via shell.
  */
 object TriggerHelper {
-
-    private const val KEY_ASSISTANT = "assistant"
-    private const val KEY_VOICE_INTERACTION_SERVICE = "voice_interaction_service"
 
     fun performHapticFeedback(context: Context) {
         try {
@@ -47,130 +50,91 @@ object TriggerHelper {
     }
 
     /**
-     * Primary Gemini trigger. Fires android.intent.action.VOICE_COMMAND scoped to the Google app
-     * package; that activity is registered by Gemini and resolves on every device that has the
-     * Google app installed.
+     * Primary Gemini trigger.
+     *
+     * On many ColorOS devices `Intent.ACTION_VOICE_COMMAND` only resolves to
+     * `HandsFreeActivity` when fired from system_server (uid 1000). HandsFreeActivity inspects
+     * the caller and only redirects to Gemini for shell-style callers; for system uid it falls
+     * back to the Bluetooth SCO hands-free path and `finish()`es when no SCO session is active.
+     * That is the well-known "screen pulses, nothing happens" symptom and an intent route can
+     * not avoid it on these devices.
+     *
+     * The reliable path is `VoiceInteractionManagerService.showSessionForActiveService`, which
+     * is what SystemUI itself uses for the assistant gesture. Earlier versions of this module
+     * also rewrote `Settings.Secure.assistant` immediately before calling showSession; that race
+     * caused the assistant rebind to overlap with the dispatch and produced occasional failures.
+     * This implementation deliberately does not touch `Settings.Secure`. The settings UI exposes
+     * a separate one-shot "set Google as default assistant" button instead, so the rebind always
+     * happens out-of-band.
+     *
+     * Order of attempts:
+     *  1. VIMS showSessionForActiveService — works whenever the active VoiceInteractionService is
+     *     already Google. No rebind, no race.
+     *  2. Intent ACTION_VOICE_COMMAND scoped to the Google app — kept for devices where caller
+     *     uid does not change HandsFreeActivity behaviour.
+     *  3. Shell `am start` — last resort.
      */
     fun triggerGemini(context: Context) {
+        val token = Binder.clearCallingIdentity()
         try {
-            val intent = Intent(Intent.ACTION_VOICE_COMMAND).apply {
+            if (tryShowSessionViaVims()) return
+
+            val voiceCommand = Intent(Intent.ACTION_VOICE_COMMAND).apply {
                 setPackage(Config.PKG_GOOGLE)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
+            if (tryStart(context, voiceCommand, "VOICE_COMMAND(framework-resolved)")) return
 
-            val token = Binder.clearCallingIdentity()
-            try {
-                context.startActivity(intent)
-            } finally {
-                Binder.restoreCallingIdentity(token)
-            }
-            XLog.debug("Triggered Gemini via VOICE_COMMAND intent")
-        } catch (e: Throwable) {
-            XLog.error("Gemini intent path failed: ${e.message}, trying shell fallback")
+            XLog.error("All Gemini paths failed; falling back to shell")
             triggerGeminiFallbackByShell()
+        } finally {
+            Binder.restoreCallingIdentity(token)
         }
     }
 
     /**
-     * Alternate Gemini trigger that goes through VoiceInteractionManagerService. Kept for cases
-     * where a caller explicitly wants the SystemUI assistant gesture handoff (screenshot etc.).
-     * Not used on the default press path because of the rebind race described in the file header.
+     * Calls `VoiceInteractionManagerService.showSessionForActiveService` directly. Returns true if
+     * the framework reported the session was shown; false otherwise.
+     *
+     * Notably does NOT touch `Settings.Secure` — that is a separate concern handled in the UI.
      */
-    fun triggerGeminiViaVoiceService(context: Context) {
-        ensureGoogleAssistant(context)
-
-        try {
-            val binder = getService("voiceinteraction")
-            if (binder == null) {
-                XLog.error("VoiceInteractionService binder is null, falling back to intent")
-                triggerGemini(context)
-                return
-            }
-
-            val stubClass = Class.forName("com.android.internal.app.IVoiceInteractionManagerService\$Stub")
-            val service = stubClass.getMethod("asInterface", IBinder::class.java).invoke(null, binder)!!
-            val bundle = newAssistantInvocationBundle()
-
-            ResourceHookState.isTempHookEnabled = true
-            val invoked = try {
-                invokeVoiceInteractionService(service, bundle)
-            } finally {
-                ResourceHookState.isTempHookEnabled = false
-            }
-
-            if (invoked) {
-                XLog.debug("Triggered Gemini via VoiceInteractionManagerService")
-            } else {
-                XLog.error("VIMS showSession returned non-true; falling back to intent")
-                triggerGemini(context)
-            }
-        } catch (e: Throwable) {
-            XLog.error("Failed to trigger Gemini via VIMS: ${e.message}")
-            ResourceHookState.isTempHookEnabled = false
-            triggerGemini(context)
-        }
-    }
-
-    private fun ensureGoogleAssistant(context: Context) {
-        try {
-            val component = findGoogleVoiceInteractionService(context)
-            if (component == null) {
-                XLog.error("Google VoiceInteractionService not found")
-                return
-            }
-
-            val value = component.flattenToString()
-            val resolver = context.contentResolver
-            val assistant = Settings.Secure.getString(resolver, KEY_ASSISTANT)
-            val voiceService = Settings.Secure.getString(resolver, KEY_VOICE_INTERACTION_SERVICE)
-
-            if (assistant != value || voiceService != value) {
-                val token = Binder.clearCallingIdentity()
-                try {
-                    putSecureString(resolver, KEY_ASSISTANT, value)
-                    putSecureString(resolver, KEY_VOICE_INTERACTION_SERVICE, value)
-                } finally {
-                    Binder.restoreCallingIdentity(token)
-                }
-                XLog.debug("Default assistant corrected to $value")
-            }
-        } catch (e: Throwable) {
-            XLog.error("Failed to ensure Google default assistant: ${e.message}")
-        }
-    }
-
-    private fun findGoogleVoiceInteractionService(context: Context): ComponentName? {
-        val intent = Intent(VoiceInteractionService.SERVICE_INTERFACE).setPackage(Config.PKG_GOOGLE)
-        val services = context.packageManager.queryIntentServices(intent, 0)
-        val service = services.firstOrNull { info ->
-            info.serviceInfo?.permission == android.Manifest.permission.BIND_VOICE_INTERACTION
-        }?.serviceInfo ?: services.firstOrNull()?.serviceInfo ?: return null
-
-        return ComponentName(service.packageName, service.name)
-    }
-
-    private fun putSecureString(resolver: ContentResolver, key: String, value: String) {
-        try {
-            val method = Settings.Secure::class.java.getMethod(
-                "putStringForUser",
-                ContentResolver::class.java,
-                String::class.java,
-                String::class.java,
-                Integer.TYPE
-            )
-            method.invoke(null, resolver, key, value, currentUserId())
-        } catch (_: Throwable) {
-            Settings.Secure.putString(resolver, key, value)
-        }
-    }
-
-    private fun currentUserId(): Int {
+    private fun tryShowSessionViaVims(): Boolean {
         return try {
-            Class.forName("android.app.ActivityManager")
-                .getMethod("getCurrentUser")
-                .invoke(null) as Int
-        } catch (_: Throwable) {
-            0
+            val binder = getService("voiceinteraction") ?: run {
+                XLog.error("VIMS: voiceinteraction binder is null")
+                return false
+            }
+            val stubClass = Class.forName(
+                "com.android.internal.app.IVoiceInteractionManagerService\$Stub"
+            )
+            val service = stubClass.getMethod("asInterface", IBinder::class.java)
+                .invoke(null, binder) ?: return false
+
+            val bundle = newAssistantInvocationBundle()
+            val ok = invokeVoiceInteractionService(service, bundle)
+            if (ok) {
+                XLog.debug("Triggered Gemini via VIMS.showSessionForActiveService")
+            } else {
+                XLog.error("VIMS.showSession returned non-true; will fall back to intent")
+            }
+            ok
+        } catch (e: Throwable) {
+            XLog.error("VIMS path failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun tryStart(context: Context, intent: Intent, label: String): Boolean {
+        return try {
+            context.startActivity(intent)
+            XLog.debug("Triggered Gemini via $label")
+            true
+        } catch (e: android.content.ActivityNotFoundException) {
+            XLog.error("$label: no matching activity")
+            false
+        } catch (e: Throwable) {
+            XLog.error("$label failed: ${e.message}")
+            false
         }
     }
 
