@@ -3,196 +3,162 @@ package com.xdreamllc.oplus.hook
 import android.os.Binder
 import com.xdreamllc.oplus.Config
 import com.xdreamllc.oplus.utils.XLog
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XC_MethodReplacement
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
 
 /**
- * Hooks ContextualSearchManagerService to:
- * 1. Force SystemServer.deviceHasConfigString to return true for the contextual search resource ID
- * 2. Replace getContextualSearchPackageName to return GSA package
- * 3. No-op enforcePermission to bypass permission checks
- * 4. Clear calling identity around startContextualSearch to allow calls from SystemUI
- *
- * This is needed for Circle to Search to work on non-Pixel/Samsung devices.
+ * Enables Contextual Search on unsupported ColorOS builds while keeping permission bypasses scoped
+ * to the module's own replacement flows.
  */
 object ContextualSearchHooker {
 
     private var contextualSearchConfigId = 0
 
-    /**
-     * ThreadLocal to store the Binder identity token during startContextualSearch calls.
-     * This allows before/after hooks to share the token across the same call.
-     */
-    private val identityTokenThreadLocal = ThreadLocal<Long>()
+    fun hook(classLoader: ClassLoader) {
+        resolveContextualSearchConfigId(classLoader)
+        hookDeviceHasConfigString(classLoader)
+        hookContextualSearchPackageName(classLoader)
+        hookPermissionCheck(classLoader)
+        hookStartContextualSearch(classLoader)
+    }
 
-    fun hook(lpparam: LoadPackageParam) {
-        // First: resolve the resource ID for config_defaultContextualSearchPackageName
+    private fun resolveContextualSearchConfigId(classLoader: ClassLoader) {
         try {
-            val rStringCls = XposedHelpers.findClass(
-                "com.android.internal.R\$string",
-                lpparam.classLoader
-            )
-            contextualSearchConfigId = XposedHelpers.getStaticIntField(
-                rStringCls,
-                "config_defaultContextualSearchPackageName"
-            )
+            val rString = XposedApi.requireClass("com.android.internal.R\$string", classLoader)
+            contextualSearchConfigId = rString.getField("config_defaultContextualSearchPackageName")
+                .getInt(null)
         } catch (e: Throwable) {
             XLog.error("Failed to resolve contextualSearchConfigId: ${e.message}")
         }
+    }
 
-        // Hook 1: deviceHasConfigString → return true when checking contextual search config
+    private fun hookDeviceHasConfigString(classLoader: ClassLoader) {
         try {
-            XposedHelpers.findAndHookMethod(
-                "com.android.server.SystemServer",
-                lpparam.classLoader,
+            val owner = XposedApi.requireClass("com.android.server.SystemServer", classLoader)
+            val method = XposedApi.getMethod(
+                owner,
                 "deviceHasConfigString",
                 android.content.Context::class.java,
-                Integer.TYPE,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val resId = param.args[1] as Int
-                        if (resId == contextualSearchConfigId) {
-                            param.result = true
-                            XLog.debug("deviceHasConfigString: forced true for contextual search")
-                        }
-                    }
-                }
+                Integer.TYPE
             )
+            XposedApi.hook(method) { chain ->
+                val resId = chain.getArg(1) as Int
+                if (resId == contextualSearchConfigId) {
+                    XLog.debug("deviceHasConfigString: forced true for contextual search")
+                    true
+                } else {
+                    chain.proceed()
+                }
+            }
         } catch (e: Throwable) {
             XLog.error("Hook deviceHasConfigString failed: ${e.message}")
         }
+    }
 
-        // Hook 2: getContextualSearchPackageName → return GSA
+    private fun hookContextualSearchPackageName(classLoader: ClassLoader) {
         try {
-            XposedHelpers.findAndHookMethod(
+            val owner = XposedApi.requireClass(
                 "com.android.server.contextualsearch.ContextualSearchManagerService",
-                lpparam.classLoader,
-                "getContextualSearchPackageName",
-                object : XC_MethodReplacement() {
-                    override fun replaceHookedMethod(param: MethodHookParam): Any {
-                        return Config.PKG_GOOGLE
-                    }
-                }
+                classLoader
             )
+            val method = XposedApi.getMethod(owner, "getContextualSearchPackageName")
+            XposedApi.hook(method) { Config.PKG_GOOGLE }
         } catch (e: Throwable) {
             XLog.error("Hook getContextualSearchPackageName failed: ${e.message}")
         }
+    }
 
-        // Hook 3: enforcePermission → no-op
+    private fun hookPermissionCheck(classLoader: ClassLoader) {
         try {
-            XposedHelpers.findAndHookMethod(
+            val owner = XposedApi.requireClass(
                 "com.android.server.contextualsearch.ContextualSearchManagerService",
-                lpparam.classLoader,
-                "enforcePermission",
-                String::class.java,
-                XC_MethodReplacement.DO_NOTHING
+                classLoader
             )
+            val method = XposedApi.getMethod(owner, "enforcePermission", String::class.java)
+            XposedApi.hook(method) { chain ->
+                val callingUid = Binder.getCallingUid()
+                if (HookGuard.shouldAllowContextualSearchFrom(callingUid)) {
+                    XLog.debug("ContextualSearch permission bypassed for UID=$callingUid")
+                    null
+                } else {
+                    chain.proceed()
+                }
+            }
         } catch (e: Throwable) {
             XLog.error("Hook enforcePermission failed: ${e.message}")
         }
-
-        // Hook 4: Clear calling identity around startContextualSearch execution
-        // This is the KEY fix for the gesture bar issue.
-        // When SystemUI (UID ~10238) calls startContextualSearch via binder,
-        // the system_server side sees the calling UID as SystemUI's UID.
-        // Any internal permission checks (beyond our enforcePermission hook)
-        // will fail because SystemUI doesn't have system-level permissions.
-        // By clearing the calling identity, all downstream permission checks
-        // will see UID 1000 (system) instead of SystemUI's UID.
-        hookStartContextualSearch(lpparam)
     }
 
-    private fun hookStartContextualSearch(lpparam: LoadPackageParam) {
-        // Try the main service class
+    private fun hookStartContextualSearch(classLoader: ClassLoader) {
         val serviceClassName = "com.android.server.contextualsearch.ContextualSearchManagerService"
-        val serviceCls = XposedHelpers.findClassIfExists(serviceClassName, lpparam.classLoader)
+        val serviceClass = XposedApi.findClass(serviceClassName, classLoader)
 
-        if (serviceCls != null) {
-            val hooked = XposedBridge.hookAllMethods(
-                serviceCls,
+        if (serviceClass != null) {
+            val count = XposedApi.hookAllMethods(
+                serviceClass,
                 "startContextualSearch",
                 createIdentityClearingHook("ContextualSearchManagerService")
             )
-            if (hooked.isNotEmpty()) {
-                XLog.debug("Hooked ${hooked.size} startContextualSearch method(s) on service class for identity clearing")
+            if (count > 0) {
+                XLog.debug("Hooked $count startContextualSearch method(s) on service class")
                 return
             }
         }
 
-        // Fallback: try inner Stub class (some AOSP versions structure it this way)
         val stubClassNames = arrayOf(
             "${serviceClassName}\$ContextualSearchManagerServiceStub",
             "${serviceClassName}\$Stub",
-            "${serviceClassName}\$1"  // anonymous inner class
+            "${serviceClassName}\$1"
         )
         for (stubName in stubClassNames) {
-            try {
-                val stubCls = XposedHelpers.findClassIfExists(stubName, lpparam.classLoader)
-                if (stubCls != null) {
-                    val hooked = XposedBridge.hookAllMethods(
-                        stubCls,
-                        "startContextualSearch",
-                        createIdentityClearingHook(stubName.substringAfterLast('.'))
-                    )
-                    if (hooked.isNotEmpty()) {
-                        XLog.debug("Hooked ${hooked.size} startContextualSearch on $stubName for identity clearing")
-                        return
-                    }
-                }
-            } catch (_: Throwable) {}
+            val stubClass = XposedApi.findClass(stubName, classLoader) ?: continue
+            val count = XposedApi.hookAllMethods(
+                stubClass,
+                "startContextualSearch",
+                createIdentityClearingHook(stubName.substringAfterLast('.'))
+            )
+            if (count > 0) {
+                XLog.debug("Hooked $count startContextualSearch on $stubName")
+                return
+            }
         }
 
-        // Last resort: scan all inner classes
-        if (serviceCls != null) {
+        if (serviceClass != null) {
             try {
-                for (innerCls in serviceCls.declaredClasses) {
-                    val hooked = XposedBridge.hookAllMethods(
-                        innerCls,
+                for (innerClass in serviceClass.declaredClasses) {
+                    val count = XposedApi.hookAllMethods(
+                        innerClass,
                         "startContextualSearch",
-                        createIdentityClearingHook(innerCls.simpleName)
+                        createIdentityClearingHook(innerClass.simpleName)
                     )
-                    if (hooked.isNotEmpty()) {
-                        XLog.debug("Hooked ${hooked.size} startContextualSearch on inner class ${innerCls.simpleName} for identity clearing")
+                    if (count > 0) {
+                        XLog.debug("Hooked $count startContextualSearch on ${innerClass.simpleName}")
                         return
                     }
                 }
-            } catch (_: Throwable) {}
+            } catch (_: Throwable) {
+            }
         }
 
         XLog.error("Could not find startContextualSearch method to hook for identity clearing")
     }
 
-    private fun createIdentityClearingHook(tag: String): XC_MethodHook {
-        return object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                try {
-                    val callingUid = Binder.getCallingUid()
-                    val callingPid = Binder.getCallingPid()
-                    XLog.debug("startContextualSearch called from UID=$callingUid PID=$callingPid ($tag)")
+    private fun createIdentityClearingHook(tag: String): (io.github.libxposed.api.XposedInterface.Chain) -> Any? {
+        return { chain ->
+            val callingUid = Binder.getCallingUid()
+            val callingPid = Binder.getCallingPid()
+            XLog.debug("startContextualSearch called from UID=$callingUid PID=$callingPid ($tag)")
 
-                    // Clear calling identity so downstream checks see system UID (1000)
-                    val token = Binder.clearCallingIdentity()
-                    identityTokenThreadLocal.set(token)
-                } catch (e: Throwable) {
-                    XLog.error("startContextualSearch before hook error ($tag): ${e.message}")
+            var token: Long? = null
+            try {
+                if (HookGuard.shouldAllowContextualSearchFrom(callingUid)) {
+                    token = Binder.clearCallingIdentity()
                 }
-            }
-
-            override fun afterHookedMethod(param: MethodHookParam) {
-                try {
-                    val token = identityTokenThreadLocal.get()
-                    if (token != null) {
-                        Binder.restoreCallingIdentity(token)
-                        identityTokenThreadLocal.remove()
-                    }
-                    if (param.throwable != null) {
-                        XLog.error("startContextualSearch threw exception ($tag): ${param.throwable.message}")
-                    }
-                } catch (e: Throwable) {
-                    XLog.error("startContextualSearch after hook error ($tag): ${e.message}")
+                chain.proceed()
+            } catch (e: Throwable) {
+                XLog.error("startContextualSearch threw exception ($tag): ${e.message}")
+                throw e
+            } finally {
+                if (token != null) {
+                    Binder.restoreCallingIdentity(token)
                 }
             }
         }

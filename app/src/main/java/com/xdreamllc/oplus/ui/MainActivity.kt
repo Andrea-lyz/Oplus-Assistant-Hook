@@ -20,7 +20,16 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -30,8 +39,21 @@ import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Text
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -39,27 +61,90 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
 import com.xdreamllc.oplus.Config
 import com.xdreamllc.oplus.R
+import io.github.libxposed.service.XposedService
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var prefs: SharedPreferences
+    /**
+     * Settings store. Always wraps the framework's RemotePreferences when the Xposed service is
+     * connected, falling back to a private SharedPreferences only as a last resort so the UI is
+     * still functional when the framework is not active (the hooks then see defaults, which is
+     * what the activation card surfaces to the user).
+     */
+    private class SettingsStore(private val context: Context) {
+
+        @Volatile
+        private var remote: SharedPreferences? = null
+
+        private val fallback: SharedPreferences =
+            context.getSharedPreferences(Config.PREFS_NAME, Context.MODE_PRIVATE)
+
+        fun bind(service: XposedService?) {
+            remote = try {
+                service?.getRemotePreferences(Config.PREFS_NAME)
+            } catch (_: Throwable) {
+                null
+            }
+            if (remote != null) {
+                migrateLocalToRemote()
+            }
+        }
+
+        private fun current(): SharedPreferences = remote ?: fallback
+
+        fun getInt(key: String, default: Int): Int = current().getInt(key, default)
+
+        fun getBoolean(key: String, default: Boolean): Boolean = current().getBoolean(key, default)
+
+        fun putInt(key: String, value: Int) {
+            current().edit().putInt(key, value).apply()
+        }
+
+        fun putBoolean(key: String, value: Boolean) {
+            current().edit().putBoolean(key, value).apply()
+        }
+
+        /**
+         * Copies any value already saved to the local SharedPreferences (e.g. configured before the
+         * framework finished binding) into the remote store, so the hook side picks them up.
+         */
+        private fun migrateLocalToRemote() {
+            val target = remote ?: return
+            val all = fallback.all
+            if (all.isEmpty()) return
+            val editor = target.edit()
+            for ((key, value) in all) {
+                when (value) {
+                    is Int -> editor.putInt(key, value)
+                    is Boolean -> editor.putBoolean(key, value)
+                    is String -> editor.putString(key, value)
+                    is Long -> editor.putLong(key, value)
+                    is Float -> editor.putFloat(key, value)
+                    else -> Unit
+                }
+            }
+            editor.apply()
+        }
+    }
+
+    private lateinit var settings: SettingsStore
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        @Suppress("DEPRECATION")
-        prefs = try {
-            getSharedPreferences(Config.PREFS_NAME, Context.MODE_WORLD_READABLE)
-        } catch (_: SecurityException) {
-            getSharedPreferences(Config.PREFS_NAME, Context.MODE_PRIVATE)
-        }
-        makePrefsWorldReadable()
+        settings = SettingsStore(applicationContext)
+        settings.bind(App.service)
 
         setContent {
             LightTheme {
@@ -68,103 +153,130 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun makePrefsWorldReadable() {
-        try {
-            val prefsDir = java.io.File(applicationInfo.dataDir, "shared_prefs")
-            prefsDir.setExecutable(true, false)
-            prefsDir.setReadable(true, false)
-            val prefsFile = java.io.File(prefsDir, "${Config.PREFS_NAME}.xml")
-            if (prefsFile.exists()) {
-                prefsFile.setReadable(true, false)
-            }
-        } catch (_: Throwable) {}
-    }
-
-    // ========== Data classes ==========
-
     data class AssistantInfo(
-        val installed: Boolean,
         val name: String,
         val packageName: String,
         val icon: Bitmap? = null
     )
 
-    // ========== Helper functions ==========
-
     private fun getCurrentAssistantInfo(): AssistantInfo? {
         return try {
-            val cr = contentResolver
-            val assistantStr = Settings.Secure.getString(cr, "assistant")
+            val assistantStr = Settings.Secure.getString(contentResolver, "assistant")
             if (assistantStr.isNullOrEmpty()) return null
 
-            val cn = ComponentName.unflattenFromString(assistantStr) ?: return null
-            val pkg = cn.packageName
-            val pm = packageManager
-            val appInfo = pm.getApplicationInfo(pkg, 0)
-            val icon = drawableToBitmap(appInfo.loadIcon(pm))
-            val name = appInfo.loadLabel(pm).toString()
-
-            AssistantInfo(true, name, pkg, icon)
+            val component = ComponentName.unflattenFromString(assistantStr) ?: return null
+            val appInfo = packageManager.getApplicationInfo(component.packageName, 0)
+            AssistantInfo(
+                name = appInfo.loadLabel(packageManager).toString(),
+                packageName = component.packageName,
+                icon = drawableToBitmap(appInfo.loadIcon(packageManager))
+            )
+        } catch (_: PackageManager.NameNotFoundException) {
+            null
         } catch (_: Exception) {
             null
         }
     }
 
-    private fun getAppInfo(pkg: String): AssistantInfo {
-        return try {
-            val pm = packageManager
-            val appInfo = pm.getApplicationInfo(pkg, 0)
-            val icon = drawableToBitmap(appInfo.loadIcon(pm))
-            val name = appInfo.loadLabel(pm).toString()
-            AssistantInfo(true, name, pkg, icon)
-        } catch (_: PackageManager.NameNotFoundException) {
-            AssistantInfo(false, pkg, pkg, null)
-        }
-    }
-
     private fun drawableToBitmap(drawable: Drawable): Bitmap {
         if (drawable is BitmapDrawable) return drawable.bitmap
-        val w = maxOf(drawable.intrinsicWidth, 1)
-        val h = maxOf(drawable.intrinsicHeight, 1)
-        val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val width = maxOf(drawable.intrinsicWidth, 1)
+        val height = maxOf(drawable.intrinsicHeight, 1)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
-        drawable.setBounds(0, 0, w, h)
+        drawable.setBounds(0, 0, width, height)
         drawable.draw(canvas)
         return bitmap
     }
 
     private fun openDefaultAssistantSettings() {
         try {
-            val intent = Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            startActivity(intent)
+            startActivity(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS))
         } catch (_: Throwable) {
             try {
-                val intent = Intent("android.settings.MANAGE_DEFAULT_APPS_SETTINGS")
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                startActivity(intent)
-            } catch (_: Throwable) {}
+                startActivity(Intent("android.settings.MANAGE_DEFAULT_APPS_SETTINGS"))
+            } catch (_: Throwable) {
+            }
         }
     }
 
-    // ========== UI Composables ==========
+    /**
+     * Best-effort: write Google's VoiceInteractionService as the system default. Requires
+     * WRITE_SECURE_SETTINGS, which is normally only granted via adb (`pm grant ... WRITE_SECURE_SETTINGS`)
+     * or a system signature. When that grant is missing we fall through to opening the native voice
+     * input settings page so the user can pick Google manually.
+     *
+     * Doing this from the UI process (not from the hook on each press) avoids the racy
+     * VoiceInteractionManagerService rebind that caused Gemini to occasionally fail to appear when
+     * the system_server route was used.
+     */
+    private fun setGoogleAsDefaultAssistantOrOpenSettings(): Boolean {
+        val component = findGoogleVoiceInteractionService() ?: run {
+            openDefaultAssistantSettings()
+            return false
+        }
+        val value = component.flattenToString()
+        return try {
+            Settings.Secure.putString(contentResolver, "assistant", value)
+            Settings.Secure.putString(contentResolver, "voice_interaction_service", value)
+            true
+        } catch (_: SecurityException) {
+            openDefaultAssistantSettings()
+            false
+        } catch (_: Throwable) {
+            openDefaultAssistantSettings()
+            false
+        }
+    }
+
+    private fun findGoogleVoiceInteractionService(): ComponentName? {
+        val intent = Intent("android.service.voice.VoiceInteractionService").setPackage(Config.PKG_GOOGLE)
+        val services = packageManager.queryIntentServices(intent, 0)
+        val service = services.firstOrNull { info ->
+            info.serviceInfo?.permission == android.Manifest.permission.BIND_VOICE_INTERACTION
+        }?.serviceInfo ?: services.firstOrNull()?.serviceInfo ?: return null
+        return ComponentName(service.packageName, service.name)
+    }
 
     @Composable
     fun MainScreen() {
-        var powerMode by remember {
-            mutableIntStateOf(prefs.getInt(Config.KEY_POWER_MODE, Config.POWER_MODE_GEMINI))
-        }
-        var gestureBarEnabled by remember {
-            mutableStateOf(prefs.getBoolean(Config.KEY_GESTURE_BAR_ENABLED, true))
-        }
         val context = LocalContext.current
+
+        // Track the live XposedService binding so the activation card and the prefs store update
+        // automatically when the framework attaches (or dies).
+        var service by remember { mutableStateOf(App.service) }
+        DisposableEffect(Unit) {
+            val listener = object : App.ServiceStateListener {
+                override fun onServiceStateChanged(s: XposedService?) {
+                    service = s
+                    settings.bind(s)
+                }
+            }
+            App.addServiceStateListener(listener, notifyImmediately = true)
+            onDispose { App.removeServiceStateListener(listener) }
+        }
+
+        // Mirror the persisted configuration into Compose state. We re-read on every recomposition
+        // through the SettingsStore, which always points at whichever store is currently
+        // authoritative (RemotePreferences when bound, local SharedPreferences otherwise).
+        var powerMode by remember(service) {
+            mutableIntStateOf(settings.getInt(Config.KEY_POWER_MODE, Config.DEFAULT_POWER_MODE))
+        }
+        var gestureBarEnabled by remember(service) {
+            mutableStateOf(
+                settings.getBoolean(
+                    Config.KEY_GESTURE_BAR_ENABLED,
+                    Config.DEFAULT_GESTURE_BAR_ENABLED
+                )
+            )
+        }
+
         var assistantInfo by remember { mutableStateOf(getCurrentAssistantInfo()) }
-        
-        // Refresh assistantInfo when returning from settings
-        val lifecycleOwner = context as? androidx.lifecycle.LifecycleOwner
-        DisposableEffect(lifecycleOwner) {
-            val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-                if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+
+        DisposableEffect(context) {
+            val lifecycleOwner = context as? LifecycleOwner
+            val observer = LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_RESUME) {
                     assistantInfo = getCurrentAssistantInfo()
                 }
             }
@@ -174,14 +286,9 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        val geminiInfo = remember { getAppInfo("com.google.android.apps.bard") }
-        val gsaInfo = remember { getAppInfo(Config.PKG_GOOGLE) }
-
         val scrollState = rememberScrollState()
 
-        Scaffold(
-            containerColor = Color.White
-        ) { padding ->
+        Scaffold(containerColor = Color.White) { padding ->
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -191,121 +298,104 @@ class MainActivity : ComponentActivity() {
             ) {
                 Spacer(modifier = Modifier.height(20.dp))
 
-                // Header
                 Text(
-                    text = "Oplus Assistant Hook",
+                    text = stringResource(R.string.app_name),
                     fontSize = 26.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color(0xFF1A1A1A)
                 )
                 Text(
-                    text = "ColorOS 助手替换模块 v1.1.0",
+                    text = stringResource(R.string.app_subtitle),
                     fontSize = 13.sp,
                     color = Color(0xFF888888),
                     modifier = Modifier.padding(top = 2.dp)
                 )
 
                 Spacer(modifier = Modifier.height(20.dp))
-
-                // Module status
-                ModuleStatusCard()
+                ModuleStatusCard(service)
 
                 Spacer(modifier = Modifier.height(16.dp))
-
-                // Default assistant check
-                DefaultAssistantCard(assistantInfo)
+                DefaultAssistantCard(
+                    assistantInfo = assistantInfo,
+                    onRefresh = { assistantInfo = getCurrentAssistantInfo() }
+                )
 
                 Spacer(modifier = Modifier.height(24.dp))
-
-                // Section 1: Power button
                 SectionHeader(
-                    title = "电源键长按替换",
-                    subtitle = "拦截 ColorOS 长按电源键唤醒小布助手"
+                    title = stringResource(R.string.section_power_title),
+                    subtitle = stringResource(R.string.section_power_subtitle)
                 )
 
                 Spacer(modifier = Modifier.height(10.dp))
-
                 RadioOptionCard(
-                    title = "Gemini",
-                    subtitle = "启动 Google Gemini 助手",
+                    title = stringResource(R.string.option_gemini_title),
+                    subtitle = stringResource(R.string.option_gemini_subtitle),
                     iconResId = R.drawable.gemini,
                     selected = powerMode == Config.POWER_MODE_GEMINI,
                     accentColor = Color(0xFF4285F4),
                     onClick = {
                         powerMode = Config.POWER_MODE_GEMINI
-                        prefs.edit().putInt(Config.KEY_POWER_MODE, Config.POWER_MODE_GEMINI).apply()
-                        makePrefsWorldReadable()
+                        settings.putInt(Config.KEY_POWER_MODE, Config.POWER_MODE_GEMINI)
                     }
                 )
 
                 Spacer(modifier = Modifier.height(8.dp))
-
                 RadioOptionCard(
-                    title = "一圈即搜",
-                    subtitle = "启动 Google Circle to Search",
+                    title = stringResource(R.string.option_circle_title),
+                    subtitle = stringResource(R.string.option_circle_subtitle),
                     iconResId = R.drawable.google,
                     selected = powerMode == Config.POWER_MODE_CIRCLE,
                     accentColor = Color(0xFF34A853),
                     onClick = {
                         powerMode = Config.POWER_MODE_CIRCLE
-                        prefs.edit().putInt(Config.KEY_POWER_MODE, Config.POWER_MODE_CIRCLE).apply()
-                        makePrefsWorldReadable()
+                        settings.putInt(Config.KEY_POWER_MODE, Config.POWER_MODE_CIRCLE)
                     }
                 )
 
                 Spacer(modifier = Modifier.height(8.dp))
-
                 RadioOptionCard(
-                    title = "不替换",
-                    subtitle = "保持原始小布助手行为",
+                    title = stringResource(R.string.option_none_title),
+                    subtitle = stringResource(R.string.option_none_subtitle),
                     iconResId = null,
                     selected = powerMode == Config.POWER_MODE_NONE,
                     accentColor = Color(0xFF999999),
                     onClick = {
                         powerMode = Config.POWER_MODE_NONE
-                        prefs.edit().putInt(Config.KEY_POWER_MODE, Config.POWER_MODE_NONE).apply()
-                        makePrefsWorldReadable()
+                        settings.putInt(Config.KEY_POWER_MODE, Config.POWER_MODE_NONE)
                     }
                 )
 
                 Spacer(modifier = Modifier.height(24.dp))
-
-                // Section 2: Gesture bar
                 SectionHeader(
-                    title = "手势指示条长按替换",
-                    subtitle = "拦截长按导航手势指示条唤醒小布识屏，替换为一圈即搜"
+                    title = stringResource(R.string.section_gesture_title),
+                    subtitle = stringResource(R.string.section_gesture_subtitle)
                 )
 
                 Spacer(modifier = Modifier.height(10.dp))
-
                 ToggleCard(
-                    title = "启用手势指示条替换",
-                    subtitle = "替换为 Google 一圈即搜",
+                    title = stringResource(R.string.toggle_gesture_title),
+                    subtitle = stringResource(R.string.toggle_gesture_subtitle),
                     checked = gestureBarEnabled,
                     onCheckedChange = {
                         gestureBarEnabled = it
-                        prefs.edit().putBoolean(Config.KEY_GESTURE_BAR_ENABLED, it).apply()
-                        makePrefsWorldReadable()
+                        settings.putBoolean(Config.KEY_GESTURE_BAR_ENABLED, it)
                     }
                 )
 
                 Spacer(modifier = Modifier.height(10.dp))
-
                 InfoCard(
-                    text = "此功能需要在系统设置 > 系统导航方式中启用「长按手势指示条唤醒小布识屏」选项"
+                    text = stringResource(R.string.gesture_requirement)
                 )
 
                 Spacer(modifier = Modifier.height(32.dp))
-
-                // Footer
                 HorizontalDivider(color = Color(0xFFEEEEEE))
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "修改设置后需重启系统方可生效",
+                    text = stringResource(R.string.footer_effective_hint),
                     fontSize = 12.sp,
                     color = Color(0xFFFF9500),
                     modifier = Modifier.fillMaxWidth(),
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    textAlign = TextAlign.Center
                 )
 
                 Spacer(modifier = Modifier.height(24.dp))
@@ -314,17 +404,47 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    fun ModuleStatusCard() {
-        val isActive = isModuleActive()
-        val statusColor = if (isActive) Color(0xFF34A853) else Color(0xFFEA4335)
-        val bgColor = if (isActive) Color(0xFFF0FAF0) else Color(0xFFFFF0EF)
+    fun ModuleStatusCard(service: XposedService?) {
+        val active = service != null
+        val frameworkName = remember(service) {
+            try {
+                service?.frameworkName
+            } catch (_: Throwable) {
+                null
+            }
+        }
+        val apiVersion = remember(service) {
+            try {
+                service?.apiVersion ?: 0
+            } catch (_: Throwable) {
+                0
+            }
+        }
+
+        val statusColor = if (active) Color(0xFF34A853) else Color(0xFFE53935)
+        val bgColor = if (active) Color(0xFFEFFAEF) else Color(0xFFFDECEA)
+        val title = if (active) {
+            stringResource(R.string.module_status_active_title)
+        } else {
+            stringResource(R.string.module_status_inactive_title)
+        }
+        val description = if (active) {
+            val name = frameworkName ?: "libxposed"
+            if (apiVersion > 0) {
+                stringResource(R.string.module_status_active_desc_with_api, name, apiVersion)
+            } else {
+                stringResource(R.string.module_status_active_desc, name)
+            }
+        } else {
+            stringResource(R.string.module_status_inactive_desc)
+        }
 
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(14.dp))
                 .background(bgColor)
-                .border(1.dp, statusColor.copy(alpha = 0.3f), RoundedCornerShape(14.dp))
+                .border(1.dp, statusColor.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
                 .padding(16.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -337,15 +457,15 @@ class MainActivity : ComponentActivity() {
                 Spacer(modifier = Modifier.width(12.dp))
                 Column {
                     Text(
-                        text = if (isActive) "模块已激活" else "模块未激活",
+                        text = title,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF1A1A1A)
                     )
                     Text(
-                        text = if (isActive) "功能正常运行中" else "请在 LSPosed 中启用本模块并重启系统",
+                        text = description,
                         fontSize = 12.sp,
-                        color = Color(0xFF888888)
+                        color = Color(0xFF666666)
                     )
                 }
             }
@@ -353,10 +473,17 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    fun DefaultAssistantCard(assistantInfo: AssistantInfo?) {
-        val isGSA = assistantInfo?.packageName == Config.PKG_GOOGLE
-        val bgColor = if (isGSA) Color(0xFFF0FAF0) else Color(0xFFFFF8E1)
-        val borderColor = if (isGSA) Color(0xFF34A853).copy(alpha = 0.3f) else Color(0xFFFFA000).copy(alpha = 0.3f)
+    fun DefaultAssistantCard(
+        assistantInfo: AssistantInfo?,
+        onRefresh: () -> Unit
+    ) {
+        val isGoogleAssistant = assistantInfo?.packageName == Config.PKG_GOOGLE
+        val bgColor = if (isGoogleAssistant) Color(0xFFF0FAF0) else Color(0xFFFFF8E1)
+        val borderColor = if (isGoogleAssistant) {
+            Color(0xFF34A853).copy(alpha = 0.3f)
+        } else {
+            Color(0xFFFFA000).copy(alpha = 0.3f)
+        }
 
         Box(
             modifier = Modifier
@@ -364,14 +491,19 @@ class MainActivity : ComponentActivity() {
                 .clip(RoundedCornerShape(14.dp))
                 .background(bgColor)
                 .border(1.dp, borderColor, RoundedCornerShape(14.dp))
-                .clickable { openDefaultAssistantSettings() }
+                .clickable {
+                    if (isGoogleAssistant) {
+                        openDefaultAssistantSettings()
+                    } else if (setGoogleAsDefaultAssistantOrOpenSettings()) {
+                        onRefresh()
+                    }
+                }
                 .padding(16.dp)
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                // Icon
                 if (assistantInfo?.icon != null) {
                     Image(
                         bitmap = assistantInfo.icon.asImageBitmap(),
@@ -390,22 +522,21 @@ class MainActivity : ComponentActivity() {
                 }
 
                 Spacer(modifier = Modifier.width(12.dp))
-
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "默认数字助理",
+                        text = stringResource(R.string.default_assistant_label),
                         fontSize = 12.sp,
                         color = Color(0xFF888888)
                     )
                     Text(
-                        text = assistantInfo?.name ?: "未设置",
+                        text = assistantInfo?.name ?: stringResource(R.string.default_assistant_unset),
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Medium,
                         color = Color(0xFF1A1A1A)
                     )
-                    if (!isGSA) {
+                    if (!isGoogleAssistant) {
                         Text(
-                            text = "建议设置为 Google 以确保功能正常",
+                            text = stringResource(R.string.default_assistant_warning),
                             fontSize = 11.sp,
                             color = Color(0xFFFFA000)
                         )
@@ -414,7 +545,7 @@ class MainActivity : ComponentActivity() {
 
                 Icon(
                     imageVector = Icons.AutoMirrored.Filled.ArrowForward,
-                    contentDescription = "打开设置",
+                    contentDescription = stringResource(R.string.open_settings),
                     tint = Color(0xFFBBBBBB),
                     modifier = Modifier.size(20.dp)
                 )
@@ -451,11 +582,13 @@ class MainActivity : ComponentActivity() {
     ) {
         val borderColor by animateColorAsState(
             targetValue = if (selected) accentColor else Color(0xFFE0E0E0),
-            animationSpec = tween(250), label = "border"
+            animationSpec = tween(250),
+            label = "border"
         )
         val bgColor by animateColorAsState(
             targetValue = if (selected) accentColor.copy(alpha = 0.06f) else Color(0xFFFAFAFA),
-            animationSpec = tween(250), label = "bg"
+            animationSpec = tween(250),
+            label = "bg"
         )
 
         Box(
@@ -468,7 +601,6 @@ class MainActivity : ComponentActivity() {
                 .padding(14.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                // Icon or radio indicator
                 if (iconResId != null) {
                     Image(
                         painter = painterResource(id = iconResId),
@@ -485,12 +617,16 @@ class MainActivity : ComponentActivity() {
                             .background(Color(0xFFEEEEEE)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text("X", fontSize = 14.sp, color = Color(0xFF999999), fontWeight = FontWeight.Bold)
+                        Text(
+                            text = "X",
+                            fontSize = 14.sp,
+                            color = Color(0xFF999999),
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
 
                 Spacer(modifier = Modifier.width(12.dp))
-
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = title,
@@ -532,11 +668,13 @@ class MainActivity : ComponentActivity() {
     ) {
         val borderColor by animateColorAsState(
             targetValue = if (checked) Color(0xFF34A853) else Color(0xFFE0E0E0),
-            animationSpec = tween(250), label = "toggleBorder"
+            animationSpec = tween(250),
+            label = "toggleBorder"
         )
         val bgColor by animateColorAsState(
             targetValue = if (checked) Color(0xFFF0FAF0) else Color(0xFFFAFAFA),
-            animationSpec = tween(250), label = "toggleBg"
+            animationSpec = tween(250),
+            label = "toggleBg"
         )
 
         Box(
@@ -560,7 +698,6 @@ class MainActivity : ComponentActivity() {
                 )
 
                 Spacer(modifier = Modifier.width(12.dp))
-
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = title,
@@ -614,11 +751,6 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
-    }
-
-    @androidx.annotation.Keep
-    fun isModuleActive(): Boolean {
-        return false
     }
 }
 

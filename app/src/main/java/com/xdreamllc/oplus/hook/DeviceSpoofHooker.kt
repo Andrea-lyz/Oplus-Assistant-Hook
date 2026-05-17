@@ -1,29 +1,32 @@
 package com.xdreamllc.oplus.hook
 
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
 import com.xdreamllc.oplus.utils.XLog
 
 /**
- * Spoofs device properties (Build.MANUFACTURER, BRAND, MODEL, PRODUCT, DEVICE)
- * to Samsung S24 Ultra within the Google Search app process.
- * This is required because Circle to Search availability is gated by device model.
+ * Spoofs device properties inside the Google Search app process.
  */
 object DeviceSpoofHooker {
 
-    fun hook(lpparam: LoadPackageParam) {
+    fun hook(classLoader: ClassLoader) {
         try {
-            val buildCls = XposedHelpers.findClass("android.os.Build", lpparam.classLoader)
+            val buildClass = XposedApi.requireClass("android.os.Build", classLoader)
 
-            XposedHelpers.setStaticObjectField(buildCls, "MANUFACTURER", "samsung")
-            XposedHelpers.setStaticObjectField(buildCls, "BRAND", "samsung")
-            XposedHelpers.setStaticObjectField(buildCls, "MODEL", "SM-S928B")
-            XposedHelpers.setStaticObjectField(buildCls, "PRODUCT", "e3s")
-            XposedHelpers.setStaticObjectField(buildCls, "DEVICE", "e3s")
+            setStaticField(buildClass, "MANUFACTURER", "samsung")
+            setStaticField(buildClass, "BRAND", "samsung")
+            setStaticField(buildClass, "MODEL", "SM-S928B")
+            setStaticField(buildClass, "PRODUCT", "e3s")
+            setStaticField(buildClass, "DEVICE", "e3s")
 
-            XLog.debug("✅ GSA device properties spoofed to Samsung S24 Ultra")
+            XLog.debug("GSA device properties spoofed to Samsung S24 Ultra")
         } catch (e: Throwable) {
             XLog.error("DeviceSpoofHooker failed: ${e.message}")
+        }
+    }
+
+    private fun setStaticField(owner: Class<*>, name: String, value: String) {
+        owner.getDeclaredField(name).apply {
+            isAccessible = true
+            set(null, value)
         }
     }
 }

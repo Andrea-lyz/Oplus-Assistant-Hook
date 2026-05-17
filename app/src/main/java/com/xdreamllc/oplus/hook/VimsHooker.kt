@@ -5,53 +5,42 @@ import android.os.Bundle
 import android.os.IBinder
 import com.xdreamllc.oplus.utils.ResourceHookState
 import com.xdreamllc.oplus.utils.XLog
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
 
 /**
- * Hooks VoiceInteractionManagerService$VoiceInteractionManagerServiceStub.showSessionFromSession
- * to detect when our Gemini trigger is invoked and manage the resource spoofing state.
- *
- * Before: if the bundle has xiaobu_trigger=true, enable temp resource hook and clear calling identity
- * After: restore calling identity and disable temp hook
+ * Manages temporary resource spoofing during VoiceInteractionManagerService calls.
  */
 object VimsHooker {
 
-    fun hook(lpparam: LoadPackageParam) {
+    fun hook(classLoader: ClassLoader) {
         try {
-            XposedHelpers.findAndHookMethod(
+            val owner = XposedApi.requireClass(
                 "com.android.server.voiceinteraction.VoiceInteractionManagerService\$VoiceInteractionManagerServiceStub",
-                lpparam.classLoader,
+                classLoader
+            )
+            val method = XposedApi.getMethod(
+                owner,
                 "showSessionFromSession",
                 IBinder::class.java,
                 Bundle::class.java,
                 Integer.TYPE,
-                String::class.java,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val bundle = param.args[1] as? Bundle ?: return
-                        if (bundle.getBoolean("xiaobu_trigger", false)) {
-                            ResourceHookState.isTempHookEnabled = true
-                            val token = Binder.clearCallingIdentity()
-                            ResourceHookState.identityThreadLocal.set(token)
-                        }
-                    }
-
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val bundle = param.args[1] as? Bundle ?: return
-                        if (bundle.getBoolean("xiaobu_trigger", false)) {
-                            ResourceHookState.isTempHookEnabled = false
-                            val token = ResourceHookState.identityThreadLocal.get()
-                            if (token != null) {
-                                Binder.restoreCallingIdentity(token)
-                                ResourceHookState.identityThreadLocal.remove()
-                            }
-                            XLog.debug("✅ VIMS session finished, identity restored")
-                        }
-                    }
-                }
+                String::class.java
             )
+            XposedApi.hook(method) { chain ->
+                val bundle = chain.getArg(1) as? Bundle
+                if (bundle?.getBoolean("xiaobu_trigger", false) != true) {
+                    return@hook chain.proceed()
+                }
+
+                val token = Binder.clearCallingIdentity()
+                ResourceHookState.isTempHookEnabled = true
+                try {
+                    chain.proceed()
+                } finally {
+                    ResourceHookState.isTempHookEnabled = false
+                    Binder.restoreCallingIdentity(token)
+                    XLog.debug("VIMS session finished, identity restored")
+                }
+            }
             XLog.debug("Hooked VIMS showSessionFromSession")
         } catch (e: Throwable) {
             XLog.error("VimsHooker failed: ${e.message}")

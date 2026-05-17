@@ -1,11 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Oplus Assistant Hook</string>
-    <string name="xposed_desc">拦截ColorOS小布助手相关功能，替换为Google Gemini或一圈即搜</string>
-    <string-array name="xposed_scope">
-        <item>com.xdreamllc.oplus</item>
-        <item>android</item>
-        <item>com.android.systemui</item>
-        <item>com.google.android.googlequicksearchbox</item>
-    </string-array>
+    <string name="xposed_desc">拦截 ColorOS 小布助手相关功能，替换为 Google Gemini 或一圈即搜</string>
+
+    <string name="app_subtitle">ColorOS 助手替换模块 v2.0.0</string>
+    <string name="section_power_title">电源键长按替换</string>
+    <string name="section_power_subtitle">拦截 ColorOS 长按电源键唤醒小布助手</string>
+    <string name="option_gemini_title">Gemini</string>
+    <string name="option_gemini_subtitle">启动 Google Gemini 助手</string>
+    <string name="option_circle_title">一圈即搜</string>
+    <string name="option_circle_subtitle">启动 Google Circle to Search</string>
+    <string name="option_none_title">不替换</string>
+    <string name="option_none_subtitle">保持原始小布助手行为</string>
+    <string name="section_gesture_title">手势指示条长按替换</string>
+    <string name="section_gesture_subtitle">拦截长按导航手势指示条唤醒小布识屏，替换为一圈即搜</string>
+    <string name="toggle_gesture_title">启用手势指示条替换</string>
+    <string name="toggle_gesture_subtitle">替换为 Google 一圈即搜</string>
+    <string name="gesture_requirement">此功能需要在系统设置 &gt; 系统导航方式中启用「长按手势指示条唤醒小布识屏」选项</string>
+    <string name="footer_effective_hint">修改设置后通常即时生效；如无响应请重启系统</string>
+    <string name="module_status_active_title">模块已激活</string>
+    <string name="module_status_active_desc">已通过 %1$s 加载到当前进程</string>
+    <string name="module_status_active_desc_with_api">已通过 %1$s（API %2$d）加载到当前进程</string>
+    <string name="module_status_inactive_title">模块未激活</string>
+    <string name="module_status_inactive_desc">请在 LSPosed 管理器中启用模块并勾选作用域，然后重启系统</string>
+    <string name="module_status_title">模块配置</string>
+    <string name="module_status_desc">请在 LSPosed 中启用模块作用域并重启系统；激活状态以 LSPosed 管理器为准</string>
+    <string name="default_assistant_label">默认数字助理</string>
+    <string name="default_assistant_unset">未设置</string>
+    <string name="default_assistant_warning">点击此卡片自动设为 Google（需 WRITE_SECURE_SETTINGS，否则跳转设置页手动选择）</string>
+    <string name="open_settings">打开设置</string>
 </resources>

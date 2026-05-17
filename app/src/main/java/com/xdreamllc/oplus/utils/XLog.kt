@@ -1,23 +1,29 @@
 package com.xdreamllc.oplus.utils
 
-import de.robv.android.xposed.XposedBridge
+import android.util.Log
+import io.github.libxposed.api.XposedInterface
 
 /**
- * Simple logging wrapper for Xposed module logging.
+ * Logging wrapper that writes to the modern Xposed log when available.
  */
 object XLog {
     private const val TAG = "OplusAssistantHook"
 
+    private var xposed: XposedInterface? = null
+
+    fun attach(api: XposedInterface) {
+        xposed = api
+    }
+
     fun debug(msg: String) {
-        XposedBridge.log("$TAG | D: $msg")
+        xposed?.log(Log.DEBUG, TAG, msg) ?: Log.d(TAG, msg)
     }
 
     fun error(msg: String) {
-        XposedBridge.log("$TAG | E: $msg")
+        xposed?.log(Log.ERROR, TAG, msg) ?: Log.e(TAG, msg)
     }
 
     fun error(msg: String, t: Throwable) {
-        XposedBridge.log("$TAG | E: $msg")
-        XposedBridge.log(t)
+        xposed?.log(Log.ERROR, TAG, msg, t) ?: Log.e(TAG, msg, t)
     }
 }

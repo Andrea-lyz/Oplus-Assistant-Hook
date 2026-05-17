@@ -1,92 +1,52 @@
 package com.xdreamllc.oplus.hook
 
+import com.xdreamllc.oplus.Config
 import com.xdreamllc.oplus.utils.XLog
-import de.robv.android.xposed.IXposedHookLoadPackage
-import de.robv.android.xposed.XC_MethodReplacement
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
+import io.github.libxposed.api.XposedModule
+import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
+import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
+import io.github.libxposed.api.XposedModuleInterface.SystemServerStartingParam
 
 /**
- * Main Xposed hook entry point.
- * Dispatches to specific hookers based on the loaded package.
+ * Modern libxposed entry point.
  */
-class HookEntry : IXposedHookLoadPackage {
+class HookEntry : XposedModule() {
 
-    override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        when (lpparam.packageName) {
-            // Hook our own app to indicate module is active
-            "com.xdreamllc.oplus" -> {
-                hookModuleActive(lpparam)
-            }
+    override fun onModuleLoaded(param: ModuleLoadedParam) {
+        XposedApi.attach(this)
+        XLog.debug("Module loaded in process=${param.processName}, system=${param.isSystemServer}")
+    }
 
-            "android" -> {
-                XLog.debug("Hooking system_server (android)")
-                try {
-                    SystemContextHooker.hook(lpparam)
-                } catch (e: Throwable) {
-                    XLog.error("SystemContextHooker failed", e)
-                }
-                try {
-                    ContextualSearchHooker.hook(lpparam)
-                } catch (e: Throwable) {
-                    XLog.error("ContextualSearchHooker failed", e)
-                }
-                try {
-                    ButtonInterceptorHooker.hook(lpparam)
-                } catch (e: Throwable) {
-                    XLog.error("ButtonInterceptorHooker failed", e)
-                }
-                try {
-                    AppBlockerHooker.hook(lpparam)
-                } catch (e: Throwable) {
-                    XLog.error("AppBlockerHooker failed", e)
-                }
-                try {
-                    VimsHooker.hook(lpparam)
-                } catch (e: Throwable) {
-                    XLog.error("VimsHooker failed", e)
-                }
-                try {
-                    ResourcesHooker.hook(lpparam)
-                } catch (e: Throwable) {
-                    XLog.error("ResourcesHooker failed", e)
-                }
-            }
+    override fun onSystemServerStarting(param: SystemServerStartingParam) {
+        XLog.debug("Hooking system_server")
+        val classLoader = param.classLoader
+        hookSafely("SystemContextHooker") { SystemContextHooker.hook(classLoader) }
+        hookSafely("ContextualSearchHooker") { ContextualSearchHooker.hook(classLoader) }
+        hookSafely("ButtonInterceptorHooker") { ButtonInterceptorHooker.hook(classLoader) }
+        hookSafely("AppBlockerHooker") { AppBlockerHooker.hook(classLoader) }
+        hookSafely("VimsHooker") { VimsHooker.hook(classLoader) }
+        hookSafely("ResourcesHooker") { ResourcesHooker.hook(classLoader) }
+    }
 
+    override fun onPackageReady(param: PackageReadyParam) {
+        when (param.packageName) {
             "com.android.systemui" -> {
                 XLog.debug("Hooking SystemUI")
-                try {
-                    GestureBarHooker.hook(lpparam)
-                } catch (e: Throwable) {
-                    XLog.error("GestureBarHooker failed", e)
-                }
+                hookSafely("GestureBarHooker") { GestureBarHooker.hook(param.classLoader) }
             }
 
-            "com.google.android.googlequicksearchbox" -> {
+            Config.PKG_GOOGLE -> {
                 XLog.debug("Hooking Google Search App")
-                try {
-                    DeviceSpoofHooker.hook(lpparam)
-                } catch (e: Throwable) {
-                    XLog.error("DeviceSpoofHooker failed", e)
-                }
+                hookSafely("DeviceSpoofHooker") { DeviceSpoofHooker.hook(param.classLoader) }
             }
         }
     }
 
-    /**
-     * Hook our own isModuleActive() method to return true when Xposed is active.
-     */
-    private fun hookModuleActive(lpparam: LoadPackageParam) {
+    private fun hookSafely(name: String, block: () -> Unit) {
         try {
-            XposedHelpers.findAndHookMethod(
-                "com.xdreamllc.oplus.ui.MainActivity",
-                lpparam.classLoader,
-                "isModuleActive",
-                XC_MethodReplacement.returnConstant(true)
-            )
-            XLog.debug("Hooked isModuleActive -> true")
+            block()
         } catch (e: Throwable) {
-            XLog.error("Failed to hook isModuleActive: ${e.message}")
+            XLog.error("$name failed", e)
         }
     }
 }
