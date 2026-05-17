@@ -88,4 +88,8 @@ sdk.dir=C\:\\path\\to\\Android\\Sdk
 
 ## 许可证
 
-当前仓库尚未包含正式 `LICENSE` 文件。公开发布前请补充明确的开源许可证。
+本项目以 [Apache License 2.0](LICENSE) 许可。
+
+附带的第三方组件许可：
+
+- `io.github.libxposed:api`、`io.github.libxposed:service` —— Apache-2.0
