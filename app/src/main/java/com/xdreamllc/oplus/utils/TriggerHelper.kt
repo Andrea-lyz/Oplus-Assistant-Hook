@@ -1,13 +1,17 @@
 package com.xdreamllc.oplus.utils
 
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.os.Binder
 import android.os.Bundle
 import android.os.IBinder
 import android.os.VibrationEffect
 import android.os.Vibrator
 import com.xdreamllc.oplus.Config
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * Triggers replacement actions from hooked system flows.
@@ -27,14 +31,21 @@ import com.xdreamllc.oplus.Config
  * dispatch, manifesting as the same symptom for unrelated reasons.
  *
  * The current strategy is:
- *  1. Call VIMS.showSessionForActiveService directly without touching Settings.Secure. The user
+ *  1. Pre-warm the Google app by `bindService`-ing its VoiceInteractionService so any
+ *     frozen / cached process is brought back to a state where it can immediately render the
+ *     assistant session. Without this step, showSession dispatches to a VIS that has not yet
+ *     been (re)bound; the SystemUI assistant gesture animation finishes first and the user only
+ *     sees the screen pulse.
+ *  2. Call VIMS.showSessionForActiveService directly without touching Settings.Secure. The user
  *     is responsible for setting Google as the default assistant once (the settings UI offers a
  *     dedicated button for this), so VIMS already has the correct active service bound.
- *  2. If VIMS is unavailable, fall back to the intent route. This still fails on the
+ *  3. If VIMS is unavailable, fall back to the intent route. This still fails on the
  *     HandsFreeActivity-only ROMs but at least covers older devices where the resolver works.
- *  3. Last resort: spawn `am start` via shell.
+ *  4. Last resort: spawn `am start` via shell.
  */
 object TriggerHelper {
+
+    private const val WARMUP_TIMEOUT_MS = 400L
 
     fun performHapticFeedback(context: Context) {
         try {
@@ -67,9 +78,17 @@ object TriggerHelper {
      * a separate one-shot "set Google as default assistant" button instead, so the rebind always
      * happens out-of-band.
      *
+     * Even with VIMS, the Google app process gets frozen / cached aggressively by the system on
+     * recent Android builds. When that happens, showSession dispatches to a VIS that hasn't been
+     * bound yet, the SystemUI assistant gesture animation finishes before Gemini's UI is ready,
+     * and the user only sees the screen pulse. We pre-warm the Google app by `bindService`-ing
+     * its VoiceInteractionService for ~400ms before issuing showSession; bindService is the
+     * documented mechanism for unfreezing a cached app, so by the time showSession runs the
+     * process is in a state where it can render its session.
+     *
      * Order of attempts:
-     *  1. VIMS showSessionForActiveService — works whenever the active VoiceInteractionService is
-     *     already Google. No rebind, no race.
+     *  1. Warm up Google app + VIMS showSessionForActiveService — works whenever the active
+     *     VoiceInteractionService is already Google. No rebind, no race.
      *  2. Intent ACTION_VOICE_COMMAND scoped to the Google app — kept for devices where caller
      *     uid does not change HandsFreeActivity behaviour.
      *  3. Shell `am start` — last resort.
@@ -77,6 +96,7 @@ object TriggerHelper {
     fun triggerGemini(context: Context) {
         val token = Binder.clearCallingIdentity()
         try {
+            warmUpGoogleApp(context)
             if (tryShowSessionViaVims()) return
 
             val voiceCommand = Intent(Intent.ACTION_VOICE_COMMAND).apply {
@@ -89,6 +109,96 @@ object TriggerHelper {
             triggerGeminiFallbackByShell()
         } finally {
             Binder.restoreCallingIdentity(token)
+        }
+    }
+
+    /**
+     * Eagerly bind to Google's VoiceInteractionService so the framework un-freezes / re-spawns the
+     * process, then unbind again. Returns once the connection is established or after a short
+     * timeout — whichever comes first. The bind is intentionally synchronous because showSession
+     * needs the VIS process to be live by the time it dispatches.
+     */
+    private fun warmUpGoogleApp(context: Context) {
+        val component = findGoogleVoiceInteractionService(context) ?: run {
+            XLog.error("warmUpGoogleApp: no Google VoiceInteractionService component")
+            return
+        }
+        val intent = Intent("android.service.voice.VoiceInteractionService").apply {
+            this.component = component
+        }
+        val latch = CountDownLatch(1)
+        val connection = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName, service: IBinder) {
+                XLog.debug("warmUpGoogleApp: connected to ${name.shortClassName}")
+                latch.countDown()
+            }
+
+            override fun onServiceDisconnected(name: ComponentName) {}
+
+            override fun onBindingDied(name: ComponentName) {
+                XLog.error("warmUpGoogleApp: binding died for ${name.shortClassName}")
+                latch.countDown()
+            }
+
+            override fun onNullBinding(name: ComponentName) {
+                XLog.debug("warmUpGoogleApp: null binding for ${name.shortClassName} (process is alive though)")
+                latch.countDown()
+            }
+        }
+
+        val bound = try {
+            // BIND_AUTO_CREATE forces the framework to start the process if it is not running.
+            context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        } catch (e: SecurityException) {
+            XLog.error("warmUpGoogleApp: bindService denied: ${e.message}")
+            false
+        } catch (e: Throwable) {
+            XLog.error("warmUpGoogleApp: bindService threw: ${e.message}")
+            false
+        }
+
+        if (!bound) {
+            // Even if bindService returned false, we still issued the request; some frameworks
+            // start the process anyway. Skip the wait.
+            try {
+                context.unbindService(connection)
+            } catch (_: Throwable) {
+            }
+            return
+        }
+
+        try {
+            val arrived = latch.await(WARMUP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            if (!arrived) {
+                XLog.debug("warmUpGoogleApp: timeout after ${WARMUP_TIMEOUT_MS}ms (proceeding anyway)")
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } finally {
+            try {
+                context.unbindService(connection)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    /**
+     * Resolves the Google app's VoiceInteractionService component. The standard
+     * `BIND_VOICE_INTERACTION` permission filter is preferred, but we fall back to any service
+     * that matches the action in case the manifest changes shape.
+     */
+    private fun findGoogleVoiceInteractionService(context: Context): ComponentName? {
+        return try {
+            val intent = Intent("android.service.voice.VoiceInteractionService")
+                .setPackage(Config.PKG_GOOGLE)
+            val services = context.packageManager.queryIntentServices(intent, 0)
+            val service = services.firstOrNull { info ->
+                info.serviceInfo?.permission == android.Manifest.permission.BIND_VOICE_INTERACTION
+            }?.serviceInfo ?: services.firstOrNull()?.serviceInfo ?: return null
+            ComponentName(service.packageName, service.name)
+        } catch (e: Throwable) {
+            XLog.error("findGoogleVoiceInteractionService failed: ${e.message}")
+            null
         }
     }
 
