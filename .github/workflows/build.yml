@@ -49,18 +49,25 @@ jobs:
           echo "version_code=${VERSION_CODE}" >> $GITHUB_OUTPUT
           echo "Building Oplus Assistant Hook v${VERSION_NAME} (${VERSION_CODE})"
 
-      # Decode signing keystore if the secret is provided. When absent, the release variant
-      # falls back to the debug keystore so the workflow still produces an installable APK.
-      - name: Decode signing keystore
+      - name: Prepare release signing
         id: signing
         env:
           SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
-          if [ -z "$SIGNING_KEYSTORE_BASE64" ]; then
-            echo "No signing keystore secret configured; release will use the debug keystore."
-            echo "keystore_path=" >> $GITHUB_OUTPUT
-            exit 0
+          missing=()
+          [ -n "$SIGNING_KEYSTORE_BASE64" ] || missing+=("SIGNING_KEYSTORE_BASE64")
+          [ -n "$SIGNING_STORE_PASSWORD" ] || missing+=("SIGNING_STORE_PASSWORD")
+          [ -n "$SIGNING_KEY_ALIAS" ] || missing+=("SIGNING_KEY_ALIAS")
+          [ -n "$SIGNING_KEY_PASSWORD" ] || missing+=("SIGNING_KEY_PASSWORD")
+
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "Missing release signing secret(s): ${missing[*]}" >&2
+            exit 1
           fi
+
           KEYSTORE_PATH="${{ runner.temp }}/release.keystore"
           echo "$SIGNING_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_PATH"
           echo "keystore_path=${KEYSTORE_PATH}" >> $GITHUB_OUTPUT
@@ -75,15 +82,17 @@ jobs:
           RELEASE_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
-          if [ -n "${RELEASE_STORE_FILE}" ]; then
-            ./gradlew :app:assembleRelease --stacktrace \
-              -Prelease.storeFile="${RELEASE_STORE_FILE}" \
-              -Prelease.storePassword="${RELEASE_STORE_PASSWORD}" \
-              -Prelease.keyAlias="${RELEASE_KEY_ALIAS}" \
-              -Prelease.keyPassword="${RELEASE_KEY_PASSWORD}"
-          else
-            ./gradlew :app:assembleRelease --stacktrace
-          fi
+          ./gradlew :app:assembleRelease --stacktrace \
+            -Prelease.storeFile="${RELEASE_STORE_FILE}" \
+            -Prelease.storePassword="${RELEASE_STORE_PASSWORD}" \
+            -Prelease.keyAlias="${RELEASE_KEY_ALIAS}" \
+            -Prelease.keyPassword="${RELEASE_KEY_PASSWORD}"
+
+      - name: Verify release APK signature
+        run: |
+          RELEASE_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n1)
+          BUILD_TOOLS_DIR="${ANDROID_HOME}/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n1)"
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose "$RELEASE_APK"
 
       - name: Rename release APK
         id: rename
