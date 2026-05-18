@@ -7,6 +7,7 @@ import android.content.ServiceConnection
 import android.os.Binder
 import android.os.Bundle
 import android.os.IBinder
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import com.xdreamllc.oplus.Config
@@ -22,30 +23,29 @@ import java.util.concurrent.TimeUnit
  * recent ColorOS / Google App combinations resolves only to `HandsFreeActivity`, which inspects
  * the caller and falls back to the Bluetooth SCO hands-free path when called by system uid,
  * `finish()`-ing immediately and producing the well-known "screen pulses, nothing happens"
- * symptom. Verified by inspecting `PackageManager.queryIntentActivities`: the result list contains
- * no other matching component.
- *
- * Earlier versions of the module worked around the failure by rewriting `Settings.Secure.assistant`
- * and calling `VoiceInteractionManagerService.showSessionForActiveService`, but the per-press
- * Settings.Secure rewrite triggered an asynchronous VIS rebind that raced with the showSession
- * dispatch, manifesting as the same symptom for unrelated reasons.
+ * symptom.
  *
  * The current strategy is:
  *  1. Pre-warm the Google app by `bindService`-ing its VoiceInteractionService so any
  *     frozen / cached process is brought back to a state where it can immediately render the
- *     assistant session. Without this step, showSession dispatches to a VIS that has not yet
- *     been (re)bound; the SystemUI assistant gesture animation finishes first and the user only
- *     sees the screen pulse.
- *  2. Call VIMS.showSessionForActiveService directly without touching Settings.Secure. The user
- *     is responsible for setting Google as the default assistant once (the settings UI offers a
- *     dedicated button for this), so VIMS already has the correct active service bound.
- *  3. If VIMS is unavailable, fall back to the intent route. This still fails on the
- *     HandsFreeActivity-only ROMs but at least covers older devices where the resolver works.
- *  4. Last resort: spawn `am start` via shell.
+ *     assistant session, then give it a short settle window once `onServiceConnected` fires so
+ *     the VIS finishes its own internal initialisation before showSession dispatches.
+ *  2. Call VIMS.showSessionForActiveService directly without touching Settings.Secure.
+ *  3. If the first attempt reports failure (VIMS returned false / VIS produced no UI), perform
+ *     one aggressive retry: re-warm the app with a longer window and dispatch again. This
+ *     covers the "VIS binding went stale after Google App was killed" case, which is the main
+ *     reason power-button wake fails intermittently and needs a default-assistant toggle to
+ *     recover.
+ *  4. Intent ACTION_VOICE_COMMAND scoped to the Google app — kept for legacy ROMs.
+ *  5. Last resort: spawn `am start` via shell.
  */
 object TriggerHelper {
 
-    private const val WARMUP_TIMEOUT_MS = 400L
+    private const val WARMUP_TIMEOUT_MS = 600L
+    private const val WARMUP_TIMEOUT_AGGRESSIVE_MS = 1000L
+    private const val POST_CONNECT_SETTLE_MS = 120L
+    private const val POST_CONNECT_SETTLE_AGGRESSIVE_MS = 250L
+    private const val SHOW_SESSION_RETRY_DELAY_MS = 80L
 
     fun performHapticFeedback(context: Context) {
         try {
@@ -63,41 +63,30 @@ object TriggerHelper {
     /**
      * Primary Gemini trigger.
      *
-     * On many ColorOS devices `Intent.ACTION_VOICE_COMMAND` only resolves to
-     * `HandsFreeActivity` when fired from system_server (uid 1000). HandsFreeActivity inspects
-     * the caller and only redirects to Gemini for shell-style callers; for system uid it falls
-     * back to the Bluetooth SCO hands-free path and `finish()`es when no SCO session is active.
-     * That is the well-known "screen pulses, nothing happens" symptom and an intent route can
-     * not avoid it on these devices.
-     *
-     * The reliable path is `VoiceInteractionManagerService.showSessionForActiveService`, which
-     * is what SystemUI itself uses for the assistant gesture. Earlier versions of this module
-     * also rewrote `Settings.Secure.assistant` immediately before calling showSession; that race
-     * caused the assistant rebind to overlap with the dispatch and produced occasional failures.
-     * This implementation deliberately does not touch `Settings.Secure`. The settings UI exposes
-     * a separate one-shot "set Google as default assistant" button instead, so the rebind always
-     * happens out-of-band.
-     *
-     * Even with VIMS, the Google app process gets frozen / cached aggressively by the system on
-     * recent Android builds. When that happens, showSession dispatches to a VIS that hasn't been
-     * bound yet, the SystemUI assistant gesture animation finishes before Gemini's UI is ready,
-     * and the user only sees the screen pulse. We pre-warm the Google app by `bindService`-ing
-     * its VoiceInteractionService for ~400ms before issuing showSession; bindService is the
-     * documented mechanism for unfreezing a cached app, so by the time showSession runs the
-     * process is in a state where it can render its session.
-     *
      * Order of attempts:
-     *  1. Warm up Google app + VIMS showSessionForActiveService — works whenever the active
-     *     VoiceInteractionService is already Google. No rebind, no race.
-     *  2. Intent ACTION_VOICE_COMMAND scoped to the Google app — kept for devices where caller
-     *     uid does not change HandsFreeActivity behaviour.
-     *  3. Shell `am start` — last resort.
+     *  1. Warm up Google app + VIMS showSessionForActiveService.
+     *  2. If that reports failure, aggressively re-warm and try once more — this is the case
+     *     that previously required the user to toggle the default assistant to recover.
+     *  3. Intent ACTION_VOICE_COMMAND scoped to the Google app.
+     *  4. Shell `am start`.
      */
     fun triggerGemini(context: Context) {
         val token = Binder.clearCallingIdentity()
         try {
-            warmUpGoogleApp(context)
-            if (tryShowSessionViaVims()) return
+            warmUpGoogleApp(context, aggressive = false)
+            if (tryShowSessionViaVims(attempt = 1)) return
+
+            // First attempt failed. The most common reason is that VIMS still holds a stale
+            // binding to a Google App process that the system killed; bindService brings the
+            // process back but VIMS's own session pipe needs an extra moment to recover.
+            XLog.debug("First showSession attempt failed; retrying with aggressive warmup")
+            try {
+                Thread.sleep(SHOW_SESSION_RETRY_DELAY_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            warmUpGoogleApp(context, aggressive = true)
+            if (tryShowSessionViaVims(attempt = 2)) return
 
             val voiceCommand = Intent(Intent.ACTION_VOICE_COMMAND).apply {
                 setPackage(Config.PKG_GOOGLE)
@@ -114,11 +103,16 @@ object TriggerHelper {
 
     /**
      * Eagerly bind to Google's VoiceInteractionService so the framework un-freezes / re-spawns the
-     * process, then unbind again. Returns once the connection is established or after a short
-     * timeout — whichever comes first. The bind is intentionally synchronous because showSession
-     * needs the VIS process to be live by the time it dispatches.
+     * process, then unbind again. Returns once the connection is established (plus a short settle
+     * window) or after [WARMUP_TIMEOUT_MS] / [WARMUP_TIMEOUT_AGGRESSIVE_MS] — whichever comes
+     * first.
+     *
+     * The aggressive variant is used after a failed showSession dispatch: it waits longer for
+     * `onServiceConnected` and gives the VIS a noticeably bigger settle window, on the
+     * assumption that we just observed an unresponsive VIS and the most likely cause is a slow
+     * cold start.
      */
-    private fun warmUpGoogleApp(context: Context) {
+    private fun warmUpGoogleApp(context: Context, aggressive: Boolean) {
         val component = findGoogleVoiceInteractionService(context) ?: run {
             XLog.error("warmUpGoogleApp: no Google VoiceInteractionService component")
             return
@@ -127,9 +121,11 @@ object TriggerHelper {
             this.component = component
         }
         val latch = CountDownLatch(1)
+        @Volatile var connected = false
         val connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName, service: IBinder) {
                 XLog.debug("warmUpGoogleApp: connected to ${name.shortClassName}")
+                connected = true
                 latch.countDown()
             }
 
@@ -142,13 +138,17 @@ object TriggerHelper {
 
             override fun onNullBinding(name: ComponentName) {
                 XLog.debug("warmUpGoogleApp: null binding for ${name.shortClassName} (process is alive though)")
+                connected = true
                 latch.countDown()
             }
         }
 
+        // BIND_AUTO_CREATE forces the framework to start the process if it is not running.
+        // BIND_IMPORTANT raises the binding's oom_adj briefly, which prevents the system from
+        // immediately re-freezing the process before showSession runs.
+        val flags = Context.BIND_AUTO_CREATE or Context.BIND_IMPORTANT
         val bound = try {
-            // BIND_AUTO_CREATE forces the framework to start the process if it is not running.
-            context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+            context.bindService(intent, connection, flags)
         } catch (e: SecurityException) {
             XLog.error("warmUpGoogleApp: bindService denied: ${e.message}")
             false
@@ -158,8 +158,6 @@ object TriggerHelper {
         }
 
         if (!bound) {
-            // Even if bindService returned false, we still issued the request; some frameworks
-            // start the process anyway. Skip the wait.
             try {
                 context.unbindService(connection)
             } catch (_: Throwable) {
@@ -167,13 +165,29 @@ object TriggerHelper {
             return
         }
 
+        val timeoutMs = if (aggressive) WARMUP_TIMEOUT_AGGRESSIVE_MS else WARMUP_TIMEOUT_MS
+        val settleMs = if (aggressive) POST_CONNECT_SETTLE_AGGRESSIVE_MS else POST_CONNECT_SETTLE_MS
         try {
-            val arrived = latch.await(WARMUP_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            val arrived = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
             if (!arrived) {
-                XLog.debug("warmUpGoogleApp: timeout after ${WARMUP_TIMEOUT_MS}ms (proceeding anyway)")
+                XLog.debug("warmUpGoogleApp: timeout after ${timeoutMs}ms (proceeding anyway, aggressive=$aggressive)")
+            } else if (connected) {
+                // Give the VIS a moment to finish its own initialisation. Without this, showSession
+                // routinely dispatches into a VIS that has accepted the bind but not yet wired up
+                // its session UI, which is one of the main causes of the "screen pulses but
+                // Gemini never appears" symptom.
+                val sleepDeadline = SystemClock.uptimeMillis() + settleMs
+                while (true) {
+                    val remaining = sleepDeadline - SystemClock.uptimeMillis()
+                    if (remaining <= 0) break
+                    try {
+                        Thread.sleep(remaining)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
+                }
             }
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
         } finally {
             try {
                 context.unbindService(connection)
@@ -208,10 +222,10 @@ object TriggerHelper {
      *
      * Notably does NOT touch `Settings.Secure` — that is a separate concern handled in the UI.
      */
-    private fun tryShowSessionViaVims(): Boolean {
+    private fun tryShowSessionViaVims(attempt: Int): Boolean {
         return try {
             val binder = getService("voiceinteraction") ?: run {
-                XLog.error("VIMS: voiceinteraction binder is null")
+                XLog.error("VIMS: voiceinteraction binder is null (attempt=$attempt)")
                 return false
             }
             val stubClass = Class.forName(
@@ -220,16 +234,16 @@ object TriggerHelper {
             val service = stubClass.getMethod("asInterface", IBinder::class.java)
                 .invoke(null, binder) ?: return false
 
-            val bundle = newAssistantInvocationBundle()
+            val bundle = newAssistantInvocationBundle(attempt)
             val ok = invokeVoiceInteractionService(service, bundle)
             if (ok) {
-                XLog.debug("Triggered Gemini via VIMS.showSessionForActiveService")
+                XLog.debug("Triggered Gemini via VIMS.showSession (attempt=$attempt)")
             } else {
-                XLog.error("VIMS.showSession returned non-true; will fall back to intent")
+                XLog.error("VIMS.showSession returned non-true on attempt=$attempt; will fall back")
             }
             ok
         } catch (e: Throwable) {
-            XLog.error("VIMS path failed: ${e.message}")
+            XLog.error("VIMS path failed (attempt=$attempt): ${e.message}")
             false
         }
     }
@@ -249,8 +263,14 @@ object TriggerHelper {
     }
 
     /**
-     * Treats only literal Boolean.TRUE as success. void / null / false all mean "I had nothing to
-     * show" on real ROMs and should fall through to the intent path.
+     * Reflectively invokes the most appropriate showSession-style method on
+     * `IVoiceInteractionManagerService`.
+     *
+     * Return semantics intentionally treat `void` and `null` as success: many OEM-modified
+     * ROMs change the upstream `boolean showSessionForActiveService(...)` signature to `void`,
+     * and earlier versions of this module mis-classified those calls as failures, which then
+     * triggered the intent fallback (which itself fails on the same ROMs because of
+     * HandsFreeActivity). Only an explicit `Boolean.FALSE` is treated as failure.
      */
     private fun invokeVoiceInteractionService(service: Any, bundle: Bundle): Boolean {
         val methods = service.javaClass.methods
@@ -260,14 +280,14 @@ object TriggerHelper {
             val args = method.parameterTypes.map { type ->
                 when {
                     type == Bundle::class.java -> bundle
-                    type == Integer.TYPE -> 7
+                    type == Integer.TYPE -> SHOW_SOURCE_ASSIST_GESTURE
                     type == java.lang.Boolean.TYPE -> true
                     IBinder::class.java.isAssignableFrom(type) -> null
                     else -> null
                 }
             }.toTypedArray()
             val result = method.invoke(service, *args)
-            return result == java.lang.Boolean.TRUE
+            return interpretShowSessionResult(method.returnType, result)
         }
 
         methods.firstOrNull { it.name == "showSessionFromSession" }?.let { method ->
@@ -276,24 +296,43 @@ object TriggerHelper {
                 when {
                     IBinder::class.java.isAssignableFrom(type) -> null
                     type == Bundle::class.java -> bundle
-                    type == Integer.TYPE -> 7
+                    type == Integer.TYPE -> SHOW_SOURCE_ASSIST_GESTURE
                     type == String::class.java -> null
                     else -> null
                 }
             }.toTypedArray()
             val result = method.invoke(service, *args)
-            return result !is Boolean || result
+            return interpretShowSessionResult(method.returnType, result)
         }
 
         return false
     }
 
-    private fun newAssistantInvocationBundle(): Bundle {
+    private fun interpretShowSessionResult(returnType: Class<*>, result: Any?): Boolean {
+        // void: only success path is "didn't throw" — caller cannot know whether the session
+        // actually rendered, so trust the framework not to silently no-op.
+        if (returnType == Void.TYPE) return true
+        // boolean: literal true means success; literal false means the framework rejected the
+        // request and we should fall through to the next attempt / intent path.
+        if (returnType == java.lang.Boolean.TYPE) return result == true
+        // Anything else: treat null/void-ish as success, only an explicit Boolean.FALSE as failure.
+        return result != java.lang.Boolean.FALSE
+    }
+
+    /**
+     * `SHOW_SOURCE_ASSIST_GESTURE`. SystemUI itself uses this when dispatching the assistant
+     * gesture, so VIMS treats it as the canonical "user explicitly asked for the assistant"
+     * source.
+     */
+    private const val SHOW_SOURCE_ASSIST_GESTURE = 7
+
+    private fun newAssistantInvocationBundle(attempt: Int): Bundle {
         return Bundle().apply {
             putInt("invocation_type", 1)
             putLong("invocation_time_ms", System.currentTimeMillis())
             putBoolean("xiaobu_trigger", true)
             putString("invocation_source", "power_button")
+            putInt("invocation_attempt", attempt)
         }
     }
 
