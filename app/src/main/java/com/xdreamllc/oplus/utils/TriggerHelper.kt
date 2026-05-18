@@ -13,6 +13,7 @@ import android.os.Vibrator
 import com.xdreamllc.oplus.Config
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Triggers replacement actions from hooked system flows.
@@ -121,11 +122,11 @@ object TriggerHelper {
             this.component = component
         }
         val latch = CountDownLatch(1)
-        @Volatile var connected = false
+        val connected = AtomicBoolean(false)
         val connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName, service: IBinder) {
                 XLog.debug("warmUpGoogleApp: connected to ${name.shortClassName}")
-                connected = true
+                connected.set(true)
                 latch.countDown()
             }
 
@@ -138,7 +139,7 @@ object TriggerHelper {
 
             override fun onNullBinding(name: ComponentName) {
                 XLog.debug("warmUpGoogleApp: null binding for ${name.shortClassName} (process is alive though)")
-                connected = true
+                connected.set(true)
                 latch.countDown()
             }
         }
@@ -171,7 +172,7 @@ object TriggerHelper {
             val arrived = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
             if (!arrived) {
                 XLog.debug("warmUpGoogleApp: timeout after ${timeoutMs}ms (proceeding anyway, aggressive=$aggressive)")
-            } else if (connected) {
+            } else if (connected.get()) {
                 // Give the VIS a moment to finish its own initialisation. Without this, showSession
                 // routinely dispatches into a VIS that has accepted the bind but not yet wired up
                 // its session UI, which is one of the main causes of the "screen pulses but
