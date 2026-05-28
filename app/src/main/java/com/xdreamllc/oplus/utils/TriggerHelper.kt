@@ -321,11 +321,17 @@ object TriggerHelper {
     }
 
     /**
-     * `SHOW_SOURCE_ASSIST_GESTURE`. SystemUI itself uses this when dispatching the assistant
-     * gesture, so VIMS treats it as the canonical "user explicitly asked for the assistant"
-     * source.
+     * `SHOW_SOURCE_ASSIST_GESTURE` from
+     * [VoiceInteractionSession](https://developer.android.com/reference/android/service/voice/VoiceInteractionSession#SHOW_SOURCE_ASSIST_GESTURE).
+     * SystemUI's `AssistManager.startAssist` passes this value when dispatching the assistant
+     * gesture and power-button-long-press paths.
+     *
+     * Earlier revisions of this file accidentally used the value `7`, which is the bitwise OR
+     * of `SHOW_WITH_ASSIST(1) | SHOW_WITH_SCREENSHOT(2) | SHOW_SOURCE_ASSIST_GESTURE(4)`.
+     * Recent GSA builds (17.26.x) tightened their invocation classifier and treat that
+     * combination as ambiguous, falling back to the disabled `ENTRYPOINT_SESSION` bucket.
      */
-    private const val SHOW_SOURCE_ASSIST_GESTURE = 7
+    private const val SHOW_SOURCE_ASSIST_GESTURE = 4
 
     /**
      * AOSP SystemUI [AssistManager] invocation-type identifier for "power button long press".
@@ -359,12 +365,27 @@ object TriggerHelper {
             // is brittle; reporting "idle" matches the common case (user is on the launcher /
             // some app, not in a call) and GSA tolerates a missing or zero value.
             putInt("invocation_phone_state", 0)
+            // Per the public VoiceInteractionSession.onShow(Bundle, int) docs, GSA reads
+            // android.intent.extra.TIME as "timing in milliseconds of the KeyEvent that
+            // triggered Assistant" and android.intent.extra.ASSIST_INPUT_DEVICE_ID as the
+            // device id of the input device that delivered the trigger key. SystemUI fills
+            // both for power long-press; new GSA classifier rejects any "system" invocation
+            // that lacks them, falling back to ENTRYPOINT_SESSION.
+            putLong(Intent.EXTRA_TIME, SystemClock.uptimeMillis())
+            putInt(Intent.EXTRA_ASSIST_INPUT_DEVICE_ID, KEYBOARD_DEVICE_ID_SYSTEM)
             // Module-internal marker so VimsHooker can recognise its own requests when the
             // call happens to be routed through showSessionFromSession on certain ColorOS
             // builds. GSA ignores unknown keys, so this is free to keep.
             putBoolean("xiaobu_trigger", true)
         }
     }
+
+    /**
+     * Input device id reported for synthesised system events. The actual value isn't important
+     * to GSA's classifier; what matters is that the key is present and a reasonable int.
+     * `-1` is the well-known "virtual / no real input device" sentinel.
+     */
+    private const val KEYBOARD_DEVICE_ID_SYSTEM = -1
 
     fun triggerGeminiFallbackByShell() {
         try {
