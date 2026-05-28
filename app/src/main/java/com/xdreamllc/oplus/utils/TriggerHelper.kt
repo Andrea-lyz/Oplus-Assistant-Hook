@@ -163,9 +163,8 @@ object TriggerHelper {
             }
 
             XLog.error(
-                "Verdict: GSA did not reach a foreground-equivalent importance within " +
-                    "${VERDICT_DELAY_MS}ms; assuming the request was silently rejected and " +
-                    "force-stopping ${Config.PKG_GOOGLE} before re-dispatching"
+                "Verdict: rejection inferred after ${VERDICT_DELAY_MS}ms; force-stopping " +
+                    "${Config.PKG_GOOGLE} and re-dispatching"
             )
 
             // Re-arm with caller identity cleared, otherwise force-stop / showSession will
@@ -190,34 +189,52 @@ object TriggerHelper {
     }
 
     /**
-     * @return `true` iff the Google app process is currently at a process importance that
-     * indicates the assistant window is actually rendered and focused. Returns `false`
-     * otherwise — including the failure mode where GSA briefly hits `IMPORTANCE_VISIBLE`
-     * because SystemUI's `AssistDisclosure` is on screen and `onHandleAssist` is processing
-     * the assist data, but GSA itself is about to reject the session.
+     * @return `true` iff at least one Google app process is currently at
+     * `IMPORTANCE_FOREGROUND` — meaning Gemini's own activity window is rendered and focused.
+     * Returns `false` otherwise — including the failure mode where GSA's `:interactor` child
+     * process briefly hits `IMPORTANCE_VISIBLE` while SystemUI's `AssistDisclosure` overlay
+     * is on screen and `onHandleAssist` runs, but no GSA-owned activity ever takes focus.
      *
-     * Why FOREGROUND is the right threshold:
-     *  - On a successful Gemini launch GSA creates its own activity window, takes focus,
-     *    and the process settles at `IMPORTANCE_FOREGROUND` (100) for the duration of the
-     *    user interaction.
-     *  - On a rejected launch GSA only momentarily reaches `IMPORTANCE_VISIBLE` (200) while
-     *    SystemUI's AssistDisclosure overlay is drawn and `onHandleAssist` runs. GSA never
-     *    creates its own foreground activity, so it never reaches FOREGROUND. ColorOS then
-     *    promptly demotes the process back to background / empty within ~1s.
+     * Why we look at *all* GSA processes:
+     *
+     * GSA is multi-process:
+     *  - `com.google.android.googlequicksearchbox` (main / default)
+     *  - `…:search` (Gemini UI activity host)
+     *  - `…:interactor` (VoiceInteractionService session host)
+     *  - `…:googleapp`, `…:lite`, etc.
+     *
+     * On a successful Gemini launch the `:search` process reaches `IMPORTANCE_FOREGROUND` (100).
+     * On a rejection the only briefly-elevated process is `:interactor`, and it never gets
+     * past `IMPORTANCE_PERCEPTIBLE_PRE_26` (125) / `IMPORTANCE_VISIBLE` (200). Picking the
+     * minimum importance across all GSA processes naturally captures the "any of them is
+     * foreground" success case while staying immune to the rejection case.
      */
     private fun didAssistantWindowAppear(context: Context): Boolean {
         return try {
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
                 ?: return false
             val processes = am.runningAppProcesses ?: return false
-            val record = processes.firstOrNull { info ->
+
+            val gsaProcesses = processes.filter { info ->
                 info.pkgList?.any { it == Config.PKG_GOOGLE } == true
-            } ?: run {
+            }
+            if (gsaProcesses.isEmpty()) {
                 XLog.error("Verdict: ${Config.PKG_GOOGLE} has no running process")
                 return false
             }
-            val ok = record.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
-            XLog.debug("Verdict: GSA importance=${record.importance} processName=${record.processName} ok=$ok")
+
+            val best = gsaProcesses.minBy { it.importance }
+            val ok = best.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
+
+            if (ok) {
+                XLog.debug("Verdict: ok=true via ${best.processName} importance=${best.importance}")
+            } else {
+                // List every observed process for diagnostics. When this branch fires it almost
+                // always means GSA's classifier rejected the request, so we want enough info to
+                // confirm that without grepping for GSA's obfuscated class names.
+                val summary = gsaProcesses.joinToString { "${it.processName}=${it.importance}" }
+                XLog.error("Verdict: ok=false (best=${best.processName} importance=${best.importance}); all GSA procs: $summary")
+            }
             ok
         } catch (e: Throwable) {
             XLog.error("Verdict probe failed: ${e.message}")
