@@ -34,12 +34,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  *     fires so the VIS finishes its own internal initialisation before showSession dispatches.
  *  2. Call VIMS.showSessionForActiveService directly without touching Settings.Secure.
  *  3. Schedule an asynchronous verdict check ~250ms later. The check observes whether GSA
- *     reached an `importance <= IMPORTANCE_VISIBLE` state — i.e. whether the assistant
- *     window actually appeared. If not, the request was silently rejected (typically by
- *     GSA 17.26+'s in-process classifier returning the cached
- *     "ENTRYPOINT_SESSION not enabled" verdict), so we force-stop GSA, re-warm, and dispatch
- *     showSession again. The user perceives the kill+restart only as a small extra latency
- *     in the failure path; the happy path pays nothing.
+ *     reached `IMPORTANCE_FOREGROUND` — i.e. whether GSA's own assistant activity window
+ *     actually rendered and took focus. If not (the rejection mode where GSA only briefly
+ *     reaches `IMPORTANCE_VISIBLE` while SystemUI's AssistDisclosure overlay is on screen
+ *     and `onHandleAssist` runs), the request was silently rejected by GSA's in-process
+ *     classifier returning the cached "ENTRYPOINT_SESSION not enabled" verdict. Force-stop
+ *     GSA, re-warm, and dispatch showSession again. The user perceives the kill+restart
+ *     only as a small extra latency in the failure path; the happy path pays nothing.
  *  4. If the *synchronous* showSession failed (VIMS itself returned false), force-stop +
  *     aggressive re-warm + retry inline. The user already lost their first press, so the
  *     side effects of force-stopping GSA cost nothing here.
@@ -66,10 +67,15 @@ object TriggerHelper {
     /**
      * How long to wait after dispatching showSession before sampling GSA's process importance
      * to decide whether the assistant window actually appeared. Tuned from the on-device
-     * timeline: in successful runs the GSA process reaches `IMPORTANCE_VISIBLE` (or better)
-     * within ~150ms of `Triggered Gemini via VIMS.showSession`; the rejection log
-     * (`E/dwkq: dvrg: ... ENTRYPOINT_SESSION is not enabled`) lands at ~50ms. 250ms gives
-     * both paths time to settle while keeping the "fail-and-recover" round-trip below ~1s.
+     * timeline:
+     *  - In successful runs GSA reaches `IMPORTANCE_FOREGROUND` within ~150ms of the
+     *    `Triggered Gemini via VIMS.showSession` log line, because GSA creates its own
+     *    activity window and takes focus.
+     *  - In rejected runs GSA only momentarily passes through `IMPORTANCE_VISIBLE` while
+     *    SystemUI's AssistDisclosure is drawn, then is demoted back to background; it never
+     *    reaches FOREGROUND because no GSA-owned window was ever created.
+     * 250ms gives both paths time to settle while keeping the fail-and-recover round-trip
+     * below ~1s.
      */
     private const val VERDICT_DELAY_MS = 250L
 
@@ -139,14 +145,8 @@ object TriggerHelper {
 
     /**
      * Single-shot worker thread that, [VERDICT_DELAY_MS] after we dispatched a showSession,
-     * checks GSA's process importance and force-stops + re-dispatches if it doesn't look
-     * foregrounded.
-     *
-     * `IMPORTANCE_FOREGROUND` (100) is the assistant-window-rendered case;
-     * `IMPORTANCE_VISIBLE` (200) covers a few transitional states GSA passes through; both
-     * are accepted as success. Anything coarser (`IMPORTANCE_PERCEPTIBLE` = 230 and up) is
-     * treated as "the request was silently dropped" — we never observed a successful Gemini
-     * launch sit at >= 230 importance during the verdict window.
+     * checks GSA's process importance and force-stops + re-dispatches if the assistant
+     * window did not actually render.
      */
     private fun scheduleAssistantVerdictCheck(context: Context) {
         Thread {
@@ -191,8 +191,19 @@ object TriggerHelper {
 
     /**
      * @return `true` iff the Google app process is currently at a process importance that
-     * indicates a visible UI. Returns `false` if the process is not running, only
-     * cached/perceptible/service-bound, or if the query fails.
+     * indicates the assistant window is actually rendered and focused. Returns `false`
+     * otherwise — including the failure mode where GSA briefly hits `IMPORTANCE_VISIBLE`
+     * because SystemUI's `AssistDisclosure` is on screen and `onHandleAssist` is processing
+     * the assist data, but GSA itself is about to reject the session.
+     *
+     * Why FOREGROUND is the right threshold:
+     *  - On a successful Gemini launch GSA creates its own activity window, takes focus,
+     *    and the process settles at `IMPORTANCE_FOREGROUND` (100) for the duration of the
+     *    user interaction.
+     *  - On a rejected launch GSA only momentarily reaches `IMPORTANCE_VISIBLE` (200) while
+     *    SystemUI's AssistDisclosure overlay is drawn and `onHandleAssist` runs. GSA never
+     *    creates its own foreground activity, so it never reaches FOREGROUND. ColorOS then
+     *    promptly demotes the process back to background / empty within ~1s.
      */
     private fun didAssistantWindowAppear(context: Context): Boolean {
         return try {
@@ -205,13 +216,8 @@ object TriggerHelper {
                 XLog.error("Verdict: ${Config.PKG_GOOGLE} has no running process")
                 return false
             }
-            // FOREGROUND = 100, VISIBLE = 200. PERCEPTIBLE = 230 means audible but not on
-            // screen, which is what we see when GSA is bound (warmup) but the assistant
-            // window never appeared.
-            val ok = record.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE
-            if (!ok) {
-                XLog.error("Verdict: GSA importance=${record.importance} (process=${record.processName})")
-            }
+            val ok = record.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
+            XLog.debug("Verdict: GSA importance=${record.importance} processName=${record.processName} ok=$ok")
             ok
         } catch (e: Throwable) {
             XLog.error("Verdict probe failed: ${e.message}")
