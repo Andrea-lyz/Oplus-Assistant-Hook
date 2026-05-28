@@ -38,8 +38,8 @@ android {
         applicationId = "com.xdreamllc.oplus"
         minSdk = 33
         targetSdk = 36
-        versionCode = 7
-        versionName = "2.2.2"
+        versionCode = 8
+        versionName = "2.2.3"
     }
 
     signingConfigs {
