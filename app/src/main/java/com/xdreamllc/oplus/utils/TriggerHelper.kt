@@ -235,7 +235,7 @@ object TriggerHelper {
             val service = stubClass.getMethod("asInterface", IBinder::class.java)
                 .invoke(null, binder) ?: return false
 
-            val bundle = newAssistantInvocationBundle(attempt)
+            val bundle = newAssistantInvocationBundle()
             val ok = invokeVoiceInteractionService(service, bundle)
             if (ok) {
                 XLog.debug("Triggered Gemini via VIMS.showSession (attempt=$attempt)")
@@ -327,13 +327,42 @@ object TriggerHelper {
      */
     private const val SHOW_SOURCE_ASSIST_GESTURE = 7
 
-    private fun newAssistantInvocationBundle(attempt: Int): Bundle {
+    /**
+     * AOSP SystemUI [AssistManager] invocation-type identifier for "power button long press".
+     *
+     * GSA's `dvmx` classifier reads `invocation_type` from the showSession Bundle and maps it
+     * to an internal entry-point enum. Setting this to `6` produces
+     * `ENTRYPOINT_POWER_BUTTON_LONG_PRESS`, which is enabled on every Gemini-aware GSA build.
+     *
+     * Setting any other value (or omitting it) causes GSA to fall back to `ENTRYPOINT_SESSION`,
+     * a generic catch-all that is **not** enabled. The user-visible symptom is exactly what we
+     * were chasing: the assistant disclosure animation flashes (SystemUI side), GSA logs
+     *
+     *   E/dwgh: Voice interaction session invocation propagation failed.
+     *   E/dwgh: dvmx: Invocation source ENTRYPOINT_SESSION is not enabled
+     *
+     * and the Gemini window never renders.
+     */
+    private const val INVOCATION_TYPE_POWER_BUTTON_LONG_PRESS = 6
+
+    private fun newAssistantInvocationBundle(): Bundle {
         return Bundle().apply {
-            putInt("invocation_type", 1)
-            putLong("invocation_time_ms", System.currentTimeMillis())
+            // Tells GSA's invocation classifier this is the canonical power-button-long-press
+            // entry point. Without this, the request is classified as ENTRYPOINT_SESSION and
+            // rejected before any Gemini UI is rendered.
+            putInt("invocation_type", INVOCATION_TYPE_POWER_BUTTON_LONG_PRESS)
+            // SystemUI uses uptime, not wall clock. GSA mostly logs this for telemetry but we
+            // mirror SystemUI exactly to avoid any anomaly heuristics keying off the value.
+            putLong("invocation_time_ms", SystemClock.uptimeMillis())
+            // Phone state (idle / ringing / off-hook). 0 = TelephonyManager.CALL_STATE_IDLE.
+            // We don't have a TelephonyManager handle here and resolving it from system_server
+            // is brittle; reporting "idle" matches the common case (user is on the launcher /
+            // some app, not in a call) and GSA tolerates a missing or zero value.
+            putInt("invocation_phone_state", 0)
+            // Module-internal marker so VimsHooker can recognise its own requests when the
+            // call happens to be routed through showSessionFromSession on certain ColorOS
+            // builds. GSA ignores unknown keys, so this is free to keep.
             putBoolean("xiaobu_trigger", true)
-            putString("invocation_source", "power_button")
-            putInt("invocation_attempt", attempt)
         }
     }
 

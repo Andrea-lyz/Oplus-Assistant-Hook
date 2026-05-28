@@ -3,7 +3,7 @@
     <string name="app_name">Oplus Assistant Hook</string>
     <string name="xposed_desc">拦截 ColorOS 小布助手相关功能，替换为 Google Gemini 或一圈即搜</string>
 
-    <string name="app_subtitle">ColorOS 助手替换模块 v2.0.0</string>
+    <string name="app_subtitle">ColorOS 助手替换模块</string>
     <string name="section_power_title">电源键长按替换</string>
     <string name="section_power_subtitle">拦截 ColorOS 长按电源键唤醒小布助手</string>
     <string name="option_gemini_title">Gemini</string>
