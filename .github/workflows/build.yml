@@ -3,8 +3,6 @@ name: Build
 on:
   push:
     branches: [main, master]
-    tags:
-      - 'v*'
   pull_request:
     branches: [main, master]
   workflow_dispatch:
@@ -128,18 +126,3 @@ jobs:
           name: mapping-v${{ steps.version.outputs.version_name }}
           path: app/build/outputs/mapping/release/
           if-no-files-found: ignore
-
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          generate_release_notes: true
-          draft: false
-          prerelease: false
-          files: |
-            ${{ steps.rename.outputs.release_apk }}
-            ${{ steps.rename.outputs.debug_apk }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

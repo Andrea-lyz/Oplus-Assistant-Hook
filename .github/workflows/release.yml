@@ -1,0 +1,262 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'New versionName (e.g. 2.2.0). The bump and tag will both use this value.'
+        required: true
+        type: string
+      version_code:
+        description: 'New versionCode (integer). Leave empty to auto-increment from the current value.'
+        required: false
+        type: string
+      release_notes:
+        description: 'Release notes (Markdown). Leave empty to auto-generate from commit history.'
+        required: false
+        type: string
+      prerelease:
+        description: 'Mark this release as a pre-release.'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, tag and publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate inputs
+        id: validate
+        env:
+          INPUT_VERSION_NAME: ${{ inputs.version_name }}
+          INPUT_VERSION_CODE: ${{ inputs.version_code }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_VERSION_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version_name must follow MAJOR.MINOR.PATCH (optionally -suffix). Got: $INPUT_VERSION_NAME"
+            exit 1
+          fi
+          if [[ -n "$INPUT_VERSION_CODE" && ! "$INPUT_VERSION_CODE" =~ ^[0-9]+$ ]]; then
+            echo "::error::version_code must be a non-negative integer. Got: $INPUT_VERSION_CODE"
+            exit 1
+          fi
+          TAG="v${INPUT_VERSION_NAME}"
+          if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists locally."
+            exit 1
+          fi
+          if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists on origin."
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Read current version and compute next versionCode
+        id: current
+        run: |
+          set -euo pipefail
+          CURRENT_NAME=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts)
+          CURRENT_CODE=$(grep -oP 'versionCode\s*=\s*\K\d+' app/build.gradle.kts)
+          echo "Current versionName=${CURRENT_NAME}, versionCode=${CURRENT_CODE}"
+
+          NEW_NAME="${{ inputs.version_name }}"
+          NEW_CODE="${{ inputs.version_code }}"
+          if [[ -z "$NEW_CODE" ]]; then
+            NEW_CODE=$((CURRENT_CODE + 1))
+          fi
+          if (( NEW_CODE <= CURRENT_CODE )); then
+            echo "::error::New versionCode ($NEW_CODE) must be greater than current ($CURRENT_CODE)."
+            exit 1
+          fi
+
+          echo "current_name=${CURRENT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "current_code=${CURRENT_CODE}" >> "$GITHUB_OUTPUT"
+          echo "new_name=${NEW_NAME}" >> "$GITHUB_OUTPUT"
+          echo "new_code=${NEW_CODE}" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version in app/build.gradle.kts
+        run: |
+          set -euo pipefail
+          NEW_NAME="${{ steps.current.outputs.new_name }}"
+          NEW_CODE="${{ steps.current.outputs.new_code }}"
+          # Replace the first match of versionCode = NN and versionName = "X.Y.Z".
+          sed -i -E "s/(versionCode\s*=\s*)[0-9]+/\1${NEW_CODE}/" app/build.gradle.kts
+          sed -i -E "s/(versionName\s*=\s*\")[^\"]+/\1${NEW_NAME}/" app/build.gradle.kts
+          echo "After bump:"
+          grep -E 'versionCode|versionName' app/build.gradle.kts
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Prepare release signing
+        id: signing
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "$SIGNING_KEYSTORE_BASE64" ] || missing+=("SIGNING_KEYSTORE_BASE64")
+          [ -n "$SIGNING_STORE_PASSWORD" ] || missing+=("SIGNING_STORE_PASSWORD")
+          [ -n "$SIGNING_KEY_ALIAS" ] || missing+=("SIGNING_KEY_ALIAS")
+          [ -n "$SIGNING_KEY_PASSWORD" ] || missing+=("SIGNING_KEY_PASSWORD")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::Missing release signing secret(s): ${missing[*]}"
+            exit 1
+          fi
+          KEYSTORE_PATH="${{ runner.temp }}/release.keystore"
+          echo "$SIGNING_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_PATH"
+          echo "keystore_path=${KEYSTORE_PATH}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release APK
+        env:
+          RELEASE_STORE_FILE: ${{ steps.signing.outputs.keystore_path }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          ./gradlew :app:assembleRelease --stacktrace \
+            -Prelease.storeFile="${RELEASE_STORE_FILE}" \
+            -Prelease.storePassword="${RELEASE_STORE_PASSWORD}" \
+            -Prelease.keyAlias="${RELEASE_KEY_ALIAS}" \
+            -Prelease.keyPassword="${RELEASE_KEY_PASSWORD}"
+
+      - name: Verify release APK signature
+        run: |
+          set -euo pipefail
+          RELEASE_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n1)
+          BUILD_TOOLS_DIR="${ANDROID_HOME}/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n1)"
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose "$RELEASE_APK"
+
+      - name: Stage release APK
+        id: stage
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          RELEASE_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n1)
+          OUT="artifacts/Oplus-Assistant-Hook_v${{ steps.current.outputs.new_name }}.apk"
+          cp "$RELEASE_APK" "$OUT"
+          sha256sum "$OUT" | tee "${OUT}.sha256"
+          echo "release_apk=${OUT}" >> "$GITHUB_OUTPUT"
+          echo "release_sha=${OUT}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        id: notes
+        env:
+          USER_NOTES: ${{ inputs.release_notes }}
+          PREV_NAME: ${{ steps.current.outputs.current_name }}
+          NEW_NAME: ${{ steps.current.outputs.new_name }}
+          NEW_CODE: ${{ steps.current.outputs.new_code }}
+        run: |
+          set -euo pipefail
+          NOTES_FILE="${{ runner.temp }}/release_notes.md"
+          {
+            echo "## Oplus Assistant Hook v${NEW_NAME} (versionCode ${NEW_CODE})"
+            echo
+            if [[ -n "${USER_NOTES}" ]]; then
+              echo "${USER_NOTES}"
+              echo
+            fi
+            echo "### Changes since v${PREV_NAME}"
+            echo
+            PREV_TAG="v${PREV_NAME}"
+            if git rev-parse "${PREV_TAG}" >/dev/null 2>&1; then
+              git log --pretty=format:'- %s (%h)' "${PREV_TAG}..HEAD" | grep -v '^- chore(release):' || true
+            else
+              echo "_No previous tag '${PREV_TAG}' found; listing the most recent 30 commits._"
+              echo
+              git log --pretty=format:'- %s (%h)' -n 30 | grep -v '^- chore(release):' || true
+            fi
+            echo
+            echo
+            APK_NAME="Oplus-Assistant-Hook_v${NEW_NAME}.apk"
+            SHA=$(awk '{print $1}' "${{ steps.stage.outputs.release_sha }}")
+            echo "### Verification"
+            echo
+            echo "\`\`\`"
+            echo "${APK_NAME}"
+            echo "sha256: ${SHA}"
+            echo "\`\`\`"
+          } > "${NOTES_FILE}"
+          echo "notes_file=${NOTES_FILE}" >> "$GITHUB_OUTPUT"
+          echo "----- generated release notes -----"
+          cat "${NOTES_FILE}"
+
+      - name: Configure git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit version bump and tag
+        run: |
+          set -euo pipefail
+          NEW_NAME="${{ steps.current.outputs.new_name }}"
+          NEW_CODE="${{ steps.current.outputs.new_code }}"
+          TAG="${{ steps.validate.outputs.tag }}"
+          git add app/build.gradle.kts
+          if git diff --cached --quiet; then
+            echo "::error::No version change detected in app/build.gradle.kts."
+            exit 1
+          fi
+          git commit -m "chore(release): v${NEW_NAME} (versionCode ${NEW_CODE}) [skip ci]"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin HEAD
+          git push origin "${TAG}"
+
+      - name: Upload release APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Oplus-Assistant-Hook-release-v${{ steps.current.outputs.new_name }}
+          path: ${{ steps.stage.outputs.release_apk }}
+          if-no-files-found: error
+
+      - name: Upload mapping file
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mapping-v${{ steps.current.outputs.new_name }}
+          path: app/build/outputs/mapping/release/
+          if-no-files-found: ignore
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.validate.outputs.tag }}
+          name: ${{ steps.validate.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.notes_file }}
+          draft: false
+          prerelease: ${{ inputs.prerelease }}
+          files: |
+            ${{ steps.stage.outputs.release_apk }}
+            ${{ steps.stage.outputs.release_sha }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
