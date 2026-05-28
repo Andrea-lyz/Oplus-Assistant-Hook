@@ -1,5 +1,6 @@
 package com.xdreamllc.oplus.utils
 
+import android.app.ActivityManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -27,18 +28,23 @@ import java.util.concurrent.atomic.AtomicBoolean
  * symptom.
  *
  * The current strategy is:
- *  1. Pre-warm the Google app by `bindService`-ing its VoiceInteractionService so any
- *     frozen / cached process is brought back to a state where it can immediately render the
- *     assistant session, then give it a short settle window once `onServiceConnected` fires so
- *     the VIS finishes its own internal initialisation before showSession dispatches.
+ *  1. Pre-warm the Google app by `bindService`-ing its VoiceInteractionService so a
+ *     potentially-frozen process is brought back to a state where it can immediately render
+ *     the assistant session, then give it a short settle window once `onServiceConnected`
+ *     fires so the VIS finishes its own internal initialisation before showSession dispatches.
  *  2. Call VIMS.showSessionForActiveService directly without touching Settings.Secure.
- *  3. If the first attempt reports failure (VIMS returned false / VIS produced no UI), perform
- *     one aggressive retry: re-warm the app with a longer window and dispatch again. This
- *     covers the "VIS binding went stale after Google App was killed" case, which is the main
- *     reason power-button wake fails intermittently and needs a default-assistant toggle to
- *     recover.
- *  4. Intent ACTION_VOICE_COMMAND scoped to the Google app — kept for legacy ROMs.
- *  5. Last resort: spawn `am start` via shell.
+ *  3. Schedule an asynchronous verdict check ~250ms later. The check observes whether GSA
+ *     reached an `importance <= IMPORTANCE_VISIBLE` state — i.e. whether the assistant
+ *     window actually appeared. If not, the request was silently rejected (typically by
+ *     GSA 17.26+'s in-process classifier returning the cached
+ *     "ENTRYPOINT_SESSION not enabled" verdict), so we force-stop GSA, re-warm, and dispatch
+ *     showSession again. The user perceives the kill+restart only as a small extra latency
+ *     in the failure path; the happy path pays nothing.
+ *  4. If the *synchronous* showSession failed (VIMS itself returned false), force-stop +
+ *     aggressive re-warm + retry inline. The user already lost their first press, so the
+ *     side effects of force-stopping GSA cost nothing here.
+ *  5. Intent ACTION_VOICE_COMMAND scoped to the Google app — kept for legacy ROMs.
+ *  6. Last resort: spawn `am start` via shell.
  */
 object TriggerHelper {
 
@@ -47,6 +53,25 @@ object TriggerHelper {
     private const val POST_CONNECT_SETTLE_MS = 120L
     private const val POST_CONNECT_SETTLE_AGGRESSIVE_MS = 250L
     private const val SHOW_SESSION_RETRY_DELAY_MS = 80L
+
+    /**
+     * Time to wait after `forceStopPackage` returns before issuing `bindService`. The kill is
+     * asynchronous (SIGKILL + AMS bookkeeping), and `bindService` will silently bind to the
+     * not-yet-cleared zombie ProcessRecord if we race it. 100ms comfortably exceeds the
+     * observed AMS cleanup time on ColorOS while staying well under the user-perceptible
+     * threshold for the long-press flow.
+     */
+    private const val FORCE_STOP_SETTLE_MS = 100L
+
+    /**
+     * How long to wait after dispatching showSession before sampling GSA's process importance
+     * to decide whether the assistant window actually appeared. Tuned from the on-device
+     * timeline: in successful runs the GSA process reaches `IMPORTANCE_VISIBLE` (or better)
+     * within ~150ms of `Triggered Gemini via VIMS.showSession`; the rejection log
+     * (`E/dwkq: dvrg: ... ENTRYPOINT_SESSION is not enabled`) lands at ~50ms. 250ms gives
+     * both paths time to settle while keeping the "fail-and-recover" round-trip below ~1s.
+     */
+    private const val VERDICT_DELAY_MS = 250L
 
     fun performHapticFeedback(context: Context) {
         try {
@@ -64,41 +89,188 @@ object TriggerHelper {
     /**
      * Primary Gemini trigger.
      *
-     * Order of attempts:
-     *  1. Warm up Google app + VIMS showSessionForActiveService.
-     *  2. If that reports failure, aggressively re-warm and try once more — this is the case
-     *     that previously required the user to toggle the default assistant to recover.
-     *  3. Intent ACTION_VOICE_COMMAND scoped to the Google app.
-     *  4. Shell `am start`.
+     * Strategy:
+     *  - Fast-path: warm GSA, dispatch showSession. If VIMS itself rejected (synchronous
+     *    failure), kill GSA and aggressively retry inline since we already lost the press.
+     *  - Asynchronous verdict: 250ms after a successful dispatch, check whether GSA reached
+     *    a foreground-equivalent process importance. If not, the request was silently
+     *    rejected by GSA's in-process classifier (`ENTRYPOINT_SESSION not enabled`); kill
+     *    GSA and re-dispatch. The user perceives this as a one-shot extra delay rather than
+     *    a failed press they have to repeat manually.
+     *
+     * The verdict probe runs on a single-shot worker thread so the system_server hook caller
+     * (`PhoneWindowManager` / `OplusSpeechHandler`) returns immediately.
      */
     fun triggerGemini(context: Context) {
         val token = Binder.clearCallingIdentity()
         try {
             warmUpGoogleApp(context, aggressive = false)
-            if (tryShowSessionViaVims(attempt = 1)) return
-
-            // First attempt failed. The most common reason is that VIMS still holds a stale
-            // binding to a Google App process that the system killed; bindService brings the
-            // process back but VIMS's own session pipe needs an extra moment to recover.
-            XLog.debug("First showSession attempt failed; retrying with aggressive warmup")
-            try {
-                Thread.sleep(SHOW_SESSION_RETRY_DELAY_MS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
+            if (!tryShowSessionViaVims(attempt = 1)) {
+                // Synchronous failure path. Always kill GSA here — we have nothing to lose.
+                XLog.debug("First showSession reported failure; force-stopping GSA and retrying with aggressive warmup")
+                forceStopGoogleApp(context)
+                try {
+                    Thread.sleep(SHOW_SESSION_RETRY_DELAY_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+                warmUpGoogleApp(context, aggressive = true)
+                if (!tryShowSessionViaVims(attempt = 2)) {
+                    val voiceCommand = Intent(Intent.ACTION_VOICE_COMMAND).apply {
+                        setPackage(Config.PKG_GOOGLE)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    if (!tryStart(context, voiceCommand, "VOICE_COMMAND(framework-resolved)")) {
+                        XLog.error("All Gemini paths failed; falling back to shell")
+                        triggerGeminiFallbackByShell()
+                    }
+                    return
+                }
             }
-            warmUpGoogleApp(context, aggressive = true)
-            if (tryShowSessionViaVims(attempt = 2)) return
 
-            val voiceCommand = Intent(Intent.ACTION_VOICE_COMMAND).apply {
-                setPackage(Config.PKG_GOOGLE)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            if (tryStart(context, voiceCommand, "VOICE_COMMAND(framework-resolved)")) return
-
-            XLog.error("All Gemini paths failed; falling back to shell")
-            triggerGeminiFallbackByShell()
+            // VIMS accepted the request. We can't tell from VIMS alone whether GSA actually
+            // rendered the assistant — that decision happens inside GSA a few tens of ms
+            // later, on a background thread, with no IPC back to us. Probe asynchronously.
+            scheduleAssistantVerdictCheck(context)
         } finally {
             Binder.restoreCallingIdentity(token)
+        }
+    }
+
+    /**
+     * Single-shot worker thread that, [VERDICT_DELAY_MS] after we dispatched a showSession,
+     * checks GSA's process importance and force-stops + re-dispatches if it doesn't look
+     * foregrounded.
+     *
+     * `IMPORTANCE_FOREGROUND` (100) is the assistant-window-rendered case;
+     * `IMPORTANCE_VISIBLE` (200) covers a few transitional states GSA passes through; both
+     * are accepted as success. Anything coarser (`IMPORTANCE_PERCEPTIBLE` = 230 and up) is
+     * treated as "the request was silently dropped" — we never observed a successful Gemini
+     * launch sit at >= 230 importance during the verdict window.
+     */
+    private fun scheduleAssistantVerdictCheck(context: Context) {
+        Thread {
+            try {
+                Thread.sleep(VERDICT_DELAY_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return@Thread
+            }
+
+            if (didAssistantWindowAppear(context)) {
+                XLog.debug("Verdict: GSA reached foreground after showSession; assistant rendered")
+                return@Thread
+            }
+
+            XLog.error(
+                "Verdict: GSA did not reach a foreground-equivalent importance within " +
+                    "${VERDICT_DELAY_MS}ms; assuming the request was silently rejected and " +
+                    "force-stopping ${Config.PKG_GOOGLE} before re-dispatching"
+            )
+
+            // Re-arm with caller identity cleared, otherwise force-stop / showSession will
+            // run with the worker thread's identity (no FORCE_STOP_PACKAGES).
+            val recoveryToken = Binder.clearCallingIdentity()
+            try {
+                forceStopGoogleApp(context)
+                warmUpGoogleApp(context, aggressive = true)
+                if (tryShowSessionViaVims(attempt = 3)) {
+                    XLog.debug("Verdict-recovery showSession dispatched")
+                } else {
+                    XLog.error("Verdict-recovery showSession also failed; giving up silently")
+                }
+            } finally {
+                Binder.restoreCallingIdentity(recoveryToken)
+            }
+        }.apply {
+            name = "OplusHook-AssistantVerdict"
+            isDaemon = true
+            start()
+        }
+    }
+
+    /**
+     * @return `true` iff the Google app process is currently at a process importance that
+     * indicates a visible UI. Returns `false` if the process is not running, only
+     * cached/perceptible/service-bound, or if the query fails.
+     */
+    private fun didAssistantWindowAppear(context: Context): Boolean {
+        return try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+                ?: return false
+            val processes = am.runningAppProcesses ?: return false
+            val record = processes.firstOrNull { info ->
+                info.pkgList?.any { it == Config.PKG_GOOGLE } == true
+            } ?: run {
+                XLog.error("Verdict: ${Config.PKG_GOOGLE} has no running process")
+                return false
+            }
+            // FOREGROUND = 100, VISIBLE = 200. PERCEPTIBLE = 230 means audible but not on
+            // screen, which is what we see when GSA is bound (warmup) but the assistant
+            // window never appeared.
+            val ok = record.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE
+            if (!ok) {
+                XLog.error("Verdict: GSA importance=${record.importance} (process=${record.processName})")
+            }
+            ok
+        } catch (e: Throwable) {
+            XLog.error("Verdict probe failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Force-stop `com.google.android.googlequicksearchbox` via reflection on
+     * `ActivityManager.forceStopPackage(String)`. The method is `@hide` (annotation
+     * `@RequiresPermission(android.Manifest.permission.FORCE_STOP_PACKAGES)`) but the call is
+     * issued from `system_server`, which holds that permission, so it succeeds.
+     *
+     * Why kill GSA at all:
+     *
+     * GSA 17.26+ caches its invocation-classifier verdicts in-process. Once the classifier
+     * decides `ENTRYPOINT_SESSION` is disabled for "this caller / device combo", every
+     * subsequent showSession from the same GSA process gets rejected with
+     *
+     *   E/dwkq: dvrg: Invocation source ENTRYPOINT_SESSION is not enabled
+     *
+     * even when the showSession Bundle is byte-for-byte identical to what SystemUI would send.
+     * Empirically the only reliable way to flush that decision is to kill the process; a
+     * manual "Force stop" from Settings -> Apps works 100% of the time, and so does this call.
+     *
+     * This function is only invoked on the failure paths (synchronous VIMS rejection or
+     * asynchronous verdict probe failure), so the side effects below are paid only when
+     * the user would otherwise see a failed press:
+     *  - Hey Google hotword listening will be re-armed after cold start (a few seconds).
+     *  - Background sync / Discover refresh of the Google app may be interrupted.
+     *  - End-to-end latency adds ~400-600ms for the cold-start path.
+     *
+     * Failures here are non-fatal: if the reflective call throws (different OEM / API level),
+     * we just continue, preserving the prior behaviour.
+     */
+    private fun forceStopGoogleApp(context: Context) {
+        try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: run {
+                XLog.error("forceStopGoogleApp: ActivityManager service unavailable")
+                return
+            }
+            val method = ActivityManager::class.java.getDeclaredMethod(
+                "forceStopPackage",
+                String::class.java
+            )
+            method.isAccessible = true
+            method.invoke(am, Config.PKG_GOOGLE)
+            XLog.debug("forceStopGoogleApp: kill request issued for ${Config.PKG_GOOGLE}")
+            // SIGKILL + AMS bookkeeping is asynchronous; sleep briefly so the subsequent
+            // bindService doesn't race the cleanup and bind to a half-torn-down ProcessRecord.
+            Thread.sleep(FORCE_STOP_SETTLE_MS)
+        } catch (e: NoSuchMethodException) {
+            XLog.error("forceStopGoogleApp: forceStopPackage(String) not found on this ROM: ${e.message}")
+        } catch (e: SecurityException) {
+            XLog.error("forceStopGoogleApp: denied (caller likely lacks FORCE_STOP_PACKAGES): ${e.message}")
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } catch (e: Throwable) {
+            XLog.error("forceStopGoogleApp failed: ${e.message}")
         }
     }
 
